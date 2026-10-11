@@ -1,7 +1,5 @@
 import os
 import sqlite3
-import shutil
-import time
 from datetime import datetime
 from reportlab.lib.utils import ImageReader
 import flet as ft
@@ -9,11 +7,23 @@ import flet_charts as fc
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
+from assistencia_core import (
+    CONCLUDED_STATUSES, STATUS_INFO, STATUS_ORDER, caminho_logo, configurar_seguranca,
+    criptografar_senha, descriptografar_senha, estatisticas_por_status, migrar_logo,
+    migrar_senhas, normalizar_status, obter_seguranca, recuperar_senha_mestra,
+    remover_logo_gerenciada, salvar_logo, status_inicial, desbloquear_com_senha,
+)
 
-VERSAO_APP = "2.1 - IMPRESSAO"
+# Flet 1.0 renomeou ElevatedButton para Button. Mantém a interface compatível
+# tanto com instalações legadas quanto com a versão atual do Flet.
+if not hasattr(ft, "ElevatedButton") and hasattr(ft, "Button"):
+    ft.ElevatedButton = ft.Button
+
+VERSAO_APP = "2.2 - SEGURANÇA"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "assistencia.db")
+SENHA_DATA_KEY = None
 
 
 # ------------------------------------------------------------------
@@ -72,6 +82,15 @@ def init_db():
             instagram TEXT DEFAULT '',
             logo_path TEXT DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS seguranca_loja (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            versao INTEGER NOT NULL DEFAULT 1,
+            master_salt BLOB NOT NULL,
+            recovery_salt BLOB NOT NULL,
+            pergunta_recuperacao TEXT NOT NULL,
+            chave_mestra_protegida TEXT NOT NULL,
+            chave_recuperacao_protegida TEXT NOT NULL
+        );
         """
     )
 
@@ -91,6 +110,7 @@ def init_db():
         "observacoes": "TEXT",
         "status": "TEXT DEFAULT 'em_manutencao'",
         "data_entrada": "TEXT",
+        "senha_versao": "INTEGER DEFAULT 0",
     }
     colunas_atuais = {row["name"] for row in conn.execute("PRAGMA table_info(aparelhos)")}
     for nome_col, tipo_col in colunas_esperadas.items():
@@ -125,6 +145,14 @@ def init_db():
            (id, nome_loja, endereco, telefone, whatsapp, instagram, logo_path)
            VALUES (1, 'MINHA ASSISTÊNCIA', '', '', '', '', '')"""
     )
+
+    # Dados legados continuam válidos, mas são trazidos para os nomes canônicos.
+    conn.execute("UPDATE aparelhos SET status = 'pronto' WHERE status = 'concluido'")
+    config = conn.execute("SELECT logo_path FROM configuracoes WHERE id = 1").fetchone()
+    if config:
+        logo_relativa = migrar_logo(BASE_DIR, config["logo_path"] or "")
+        if logo_relativa != (config["logo_path"] or ""):
+            conn.execute("UPDATE configuracoes SET logo_path = ? WHERE id = 1", (logo_relativa,))
 
     conn.commit()
     conn.close()
@@ -172,7 +200,7 @@ def salvar_configuracoes(nome_loja, endereco, telefone, whatsapp, instagram, log
                 str(telefone or "").strip(),
                 str(whatsapp or "").strip(),
                 str(instagram or "").strip(),
-                str(logo_path or "").strip(),
+                migrar_logo(BASE_DIR, str(logo_path or "").strip()),
             ),
         )
         conn.commit()
@@ -232,7 +260,7 @@ def imprimir_nota_entrada(dados, numero_os):
     INSTAGRAM = config.get("instagram") or ""
     ENDERECO_LOJA = config.get("endereco") or ""
     TELEFONE_LOJA = config.get("telefone") or ""
-    LOGO_LOJA = config.get("logo_path") or ""
+    LOGO_LOJA = caminho_logo(BASE_DIR, config.get("logo_path") or "")
 
     def txt(x, y, valor, tamanho=6, bold=False, align="left", cor=PRETO):
         c.setFillColorRGB(*cor)
@@ -515,7 +543,8 @@ def imprimir_nota_entrada(dados, numero_os):
 
         txt(esquerda + 65.0 * mm, corpo_top - 33.0 * mm, "Senha:", 4.3, True)
         hline(esquerda + 75.0 * mm, corpo_top - 33.0 * mm, limite_esq, .4)
-        txt(esquerda + 78.0 * mm, corpo_top - 32.0 * mm, dados.get("senha") or "-", 5.0)
+        senha_pdf = dados.get("senha") if dados.get("incluir_senha_pdf") else "-"
+        txt(esquerda + 78.0 * mm, corpo_top - 32.0 * mm, senha_pdf or "-", 5.0)
 
         hline(esquerda, corpo_top - 37.5 * mm, limite_esq, .4)
 
@@ -633,21 +662,28 @@ def imprimir_nota_entrada(dados, numero_os):
 
 def calcular_status_automatico(dados, status_padrao="em_orcamento"):
     """Define o status pelas marcações da tela. Serviço autorizado tem prioridade."""
-    autorizado = bool(dados.get("autorizado"))
-    orcamento = bool(dados.get("orcamento"))
-
-    if autorizado:
-        return "aguardando_peca"
-    if orcamento:
-        return "em_orcamento"
-    return status_padrao
+    return status_inicial(dados) if dados.get("autorizado") or dados.get("orcamento") else normalizar_status(dados.get("status", status_padrao))
 
 def maiusculo(texto):
     return str(texto or "").strip().upper()
 
+
+def senha_para_banco(senha):
+    """Nunca grava uma nova senha de aparelho sem a sessão protegida aberta."""
+    if not senha:
+        return "", 1
+    if not SENHA_DATA_KEY:
+        raise ValueError("Desbloqueie a senha-mestra antes de salvar senhas de aparelhos.")
+    return criptografar_senha(senha, SENHA_DATA_KEY), 1
+
+
+def senha_para_edicao(valor):
+    return descriptografar_senha(valor, SENHA_DATA_KEY)
+
 def salvar_nota(dados):
     conn = get_conn()
     cur = conn.cursor()
+    senha_banco, senha_versao = senha_para_banco(dados["senha"])
     cur.execute(
         "INSERT INTO clientes (nome, telefone, endereco, whatsapp) VALUES (?, ?, ?, ?)",
         (dados["nome"], dados["telefone"], dados["endereco"], dados["whatsapp"]),
@@ -655,12 +691,12 @@ def salvar_nota(dados):
     cliente_id = cur.lastrowid
     cur.execute(
                  """INSERT INTO aparelhos
-            (cliente_id, marca, modelo, senha, acessorios, defeitos, servico, autorizado, valor,
+            (cliente_id, marca, modelo, senha, senha_versao, acessorios, defeitos, servico, autorizado, valor,
              orcamento, relatorio, observacoes, status, data_entrada)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             cliente_id,
-            dados["marca"], dados["modelo"], dados["senha"], dados["acessorios"],
+            dados["marca"], dados["modelo"], senha_banco, senha_versao, dados["acessorios"],
                          dados["defeitos"], dados["servico"], 1 if dados["autorizado"] else 0, dados["valor"],
             1 if dados["orcamento"] else 0, dados["relatorio"], dados["observacoes"],
             calcular_status_automatico(dados),
@@ -745,16 +781,18 @@ def listar_aparelhos():
 
 def adicionar_aparelho(dados):
     conn = get_conn()
+    senha_banco, senha_versao = senha_para_banco(dados["senha"])
     conn.execute(
         """INSERT INTO aparelhos
-        (cliente_id, marca, modelo, senha, acessorios, defeitos, servico,
+        (cliente_id, marca, modelo, senha, senha_versao, acessorios, defeitos, servico,
          autorizado, valor, orcamento, relatorio, observacoes, status, data_entrada)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             dados["cliente_id"],
             dados["marca"],
             dados["modelo"],
-            dados["senha"],
+            senha_banco,
+            senha_versao,
             dados["acessorios"],
             dados["defeitos"],
             dados["servico"],
@@ -772,12 +810,14 @@ def adicionar_aparelho(dados):
 
 def atualizar_aparelho(aparelho_id, dados):
     conn = get_conn()
+    senha_banco, senha_versao = senha_para_banco(dados["senha"])
     conn.execute(
         """UPDATE aparelhos SET cliente_id = ?, marca = ?, modelo = ?, senha = ?,
+           senha_versao = ?,
            acessorios = ?, defeitos = ?, servico = ?, autorizado = ?, valor = ?, orcamento = ?,
            relatorio = ?, observacoes = ? WHERE id = ?""",
         (
-            dados["cliente_id"], dados["marca"], dados["modelo"], dados["senha"],
+            dados["cliente_id"], dados["marca"], dados["modelo"], senha_banco, senha_versao,
             dados["acessorios"], dados["defeitos"], dados["servico"],1 if dados["autorizado"] else 0, dados["valor"], 1 if dados["orcamento"] else 0, dados["relatorio"],
             dados["observacoes"], aparelho_id,
         ),
@@ -836,24 +876,14 @@ def excluir_peca(peca_id):
 
 def obter_estatisticas():
     conn = get_conn()
-    recebidos = conn.execute("SELECT COUNT(*) FROM aparelhos").fetchone()[0]
-    em_manutencao = conn.execute(
-        "SELECT COUNT(*) FROM aparelhos WHERE status = 'em_manutencao'"
-    ).fetchone()[0]
-    concluidos = conn.execute(
-        "SELECT COUNT(*) FROM aparelhos WHERE status = 'concluido'"
-    ).fetchone()[0]
+    estatisticas = estatisticas_por_status(conn)
     clientes = conn.execute("SELECT COUNT(*) FROM clientes").fetchone()[0]
     conn.close()
-    return {
-        "recebidos": recebidos,
-        "em_manutencao": em_manutencao,
-        "concluidos": concluidos,
-        "clientes": clientes,
-    }
+    return {**estatisticas, "clientes": clientes}
 
 
 def main(page: ft.Page):
+    global SENHA_DATA_KEY
     init_db()
 
     page.title = "Assistência Técnica - Ordem de Serviço"
@@ -907,6 +937,84 @@ def main(page: ft.Page):
             padding=padding,
             border=ft.Border.all(1, "#E3E5EC"),
         )
+
+    def abrir_dialogo_seguranca(recuperacao=False):
+        """Configura ou desbloqueia a chave usada para senhas de aparelhos."""
+        conn = get_conn()
+        configurada = obter_seguranca(conn) is not None
+        pergunta = obter_seguranca(conn)["pergunta_recuperacao"] if configurada else ""
+        conn.close()
+
+        senha_f = campo("Senha-mestra", password=True)
+        confirmar_f = campo("Confirmar senha-mestra", password=True)
+        pergunta_f = campo("Pergunta de recuperação")
+        resposta_f = campo("Resposta de recuperação", password=True)
+        erro = ft.Text("", color="#E5484D", size=12)
+
+        if recuperacao:
+            titulo = "Recuperar senha-mestra"
+            campos = [
+                ft.Text(f"Pergunta: {pergunta}", size=13, color="#3D4250"),
+                resposta_f, senha_f, confirmar_f, erro,
+            ]
+        elif configurada:
+            titulo = "Desbloquear senhas de aparelhos"
+            campos = [senha_f, erro]
+        else:
+            titulo = "Proteger senhas de aparelhos"
+            campos = [
+                ft.Text("Defina uma senha-mestra para proteger as senhas registradas.", size=13),
+                senha_f, confirmar_f, pergunta_f, resposta_f, erro,
+            ]
+
+        def fechar(e=None):
+            dialogo.open = False
+            page.update()
+
+        def salvar(e):
+            global SENHA_DATA_KEY
+            nonlocal configurada
+            if senha_f.value != confirmar_f.value and not configurada:
+                erro.value = "As senhas não coincidem."
+                page.update()
+                return
+            if recuperacao and senha_f.value != confirmar_f.value:
+                erro.value = "As senhas não coincidem."
+                page.update()
+                return
+            conn = get_conn()
+            try:
+                if recuperacao:
+                    SENHA_DATA_KEY = recuperar_senha_mestra(conn, resposta_f.value or "", senha_f.value or "")
+                elif configurada:
+                    SENHA_DATA_KEY = desbloquear_com_senha(conn, senha_f.value or "")
+                else:
+                    SENHA_DATA_KEY = configurar_seguranca(
+                        conn, senha_f.value or "", pergunta_f.value or "", resposta_f.value or ""
+                    )
+                    migrar_senhas(conn, SENHA_DATA_KEY)
+                conn.commit()
+            except ValueError as exc:
+                conn.rollback()
+                erro.value = str(exc)
+                page.update()
+                return
+            finally:
+                conn.close()
+            fechar()
+
+        dialogo = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(titulo),
+            content=ft.Column(campos, width=460, tight=True),
+            actions=[
+                *([] if not configurada or recuperacao else [ft.TextButton("Recuperar acesso", on_click=lambda e: (fechar(), abrir_dialogo_seguranca(True)))]),
+                ft.ElevatedButton("Salvar" if not configurada or recuperacao else "Desbloquear", on_click=salvar),
+            ],
+        )
+        page.overlay.append(dialogo)
+        dialogo.open = True
+        page.update()
 
     # ------------------------------------------------------------------
     # PÁGINA: NOTA DE ENTRADA
@@ -1121,6 +1229,7 @@ def main(page: ft.Page):
 
         servico_autorizado_marcado = False
         orcamento_marcado = False
+        incluir_senha_pdf_marcado = False
 
 
         def mudou_autorizado(e):
@@ -1136,6 +1245,10 @@ def main(page: ft.Page):
     
             orcamento_marcado = str(e.data).lower() == "true"
 
+        def mudou_incluir_senha_pdf(e):
+            nonlocal incluir_senha_pdf_marcado
+            incluir_senha_pdf_marcado = str(e.data).lower() == "true"
+
            
 
 
@@ -1150,6 +1263,11 @@ def main(page: ft.Page):
             value=False,
             on_change=mudou_orcamento,
         )
+        check_incluir_senha_pdf = ft.Checkbox(
+            label="Incluir senha no PDF",
+            value=False,
+            on_change=mudou_incluir_senha_pdf,
+        )
 
 
         bloco_servico = cartao(
@@ -1158,7 +1276,7 @@ def main(page: ft.Page):
                 [
                     campo_servico,
                     ft.Row(
-                        [campo_valor, check_autorizado, check_orcamento],
+                        [campo_valor, check_autorizado, check_orcamento, check_incluir_senha_pdf],
                         spacing=8,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
@@ -1283,6 +1401,7 @@ def main(page: ft.Page):
         "orcamento": orcamento_marcado,
         "relatorio": maiusculo(valor_campo(relatorio_tecnico)),
         "observacoes": maiusculo(valor_campo(observacoes)),
+        "incluir_senha_pdf": incluir_senha_pdf_marcado,
     }
 
             # Regra DEFINITIVA da Nota de Entrada:
@@ -1316,7 +1435,7 @@ def main(page: ft.Page):
             page.update()
 
         def limpar_click(e):
-            nonlocal servico_autorizado_marcado, orcamento_marcado
+            nonlocal servico_autorizado_marcado, orcamento_marcado, incluir_senha_pdf_marcado
             valores_nota.clear()
 
             controles = [
@@ -1340,8 +1459,10 @@ def main(page: ft.Page):
 
             check_autorizado.value = False
             check_orcamento.value = False
+            check_incluir_senha_pdf.value = False
             servico_autorizado_marcado = False
             orcamento_marcado = False
+            incluir_senha_pdf_marcado = False
             # servico_autorizado_marcado["valor"] = False
             # orcamento_marcado["valor"] = False
 
@@ -1392,6 +1513,7 @@ def main(page: ft.Page):
         "orcamento": orcamento_marcado,
         "relatorio": maiusculo(valor_campo(relatorio_tecnico)),
         "observacoes": maiusculo(valor_campo(observacoes)),
+        "incluir_senha_pdf": incluir_senha_pdf_marcado,
     }
             if servico_autorizado_marcado:
                 dados_nota["status"] = "aguardando_peca"
@@ -1597,12 +1719,13 @@ def main(page: ft.Page):
         em_manutencao = stats["em_manutencao"]
         concluidos = stats["concluidos"]
         clientes = stats["clientes"]
+        por_status = stats["por_status"]
 
         cartoes_stat = ft.Row(
             [
                 cartao_stat(ft.Icons.PHONE_ANDROID_ROUNDED, "Aparelhos recebidos", recebidos),
                 cartao_stat(ft.Icons.BUILD_ROUNDED, "Em manutenção", em_manutencao),
-                cartao_stat(ft.Icons.CHECK_CIRCLE_ROUNDED, "Concluídos", concluidos, com_fundo=True),
+                cartao_stat(ft.Icons.CHECK_CIRCLE_ROUNDED, "Reparos concluídos", concluidos, com_fundo=True),
                 cartao_stat(ft.Icons.PEOPLE_ROUNDED, "Clientes", clientes),
             ],
             wrap=True,
@@ -1610,36 +1733,25 @@ def main(page: ft.Page):
             run_spacing=20,
         )
 
-        # --- Gráfico de barras: status dos aparelhos ---
-        maior_valor = max(recebidos, em_manutencao, concluidos, 1)
+        # Os dois gráficos mostram a mesma distribuição exclusiva por status.
+        maior_valor = max(*por_status.values(), 1)
+        grupos_status = [
+            fc.BarChartGroup(
+                x=indice,
+                rods=[fc.BarChartRod(to_y=por_status[status], width=24, color=STATUS_INFO[status][0],
+                                     border_radius=6, tooltip=STATUS_INFO[status][1])],
+            )
+            for indice, status in enumerate(STATUS_ORDER)
+        ]
 
         grafico_barras = fc.BarChart(
-            groups=[
-                fc.BarChartGroup(
-                    x=0,
-                    rods=[fc.BarChartRod(to_y=recebidos, width=40, color="#2E8BF0",
-                                              border_radius=6, tooltip="Recebidos")],
-                ),
-                fc.BarChartGroup(
-                    x=1,
-                    rods=[fc.BarChartRod(to_y=em_manutencao, width=40, color="#F5A623",
-                                              border_radius=6, tooltip="Em manutenção")],
-                ),
-                fc.BarChartGroup(
-                    x=2,
-                    rods=[fc.BarChartRod(to_y=concluidos, width=40, color="#22A559",
-                                              border_radius=6, tooltip="Concluídos")],
-                ),
-            ],
+            groups=grupos_status,
             border=ft.Border.all(0, "transparent"),
             left_axis=fc.ChartAxis(label_size=32, show_labels=True),
             bottom_axis=fc.ChartAxis(
                 label_size=32,
-                labels=[
-                    fc.ChartAxisLabel(value=0, label=ft.Text("Recebidos", size=11, color="#6B7280")),
-                    fc.ChartAxisLabel(value=1, label=ft.Text("Em manut.", size=11, color="#6B7280")),
-                    fc.ChartAxisLabel(value=2, label=ft.Text("Concluídos", size=11, color="#6B7280")),
-                ],
+                labels=[fc.ChartAxisLabel(value=i, label=ft.Text(STATUS_INFO[s][1], size=9, color="#6B7280"))
+                        for i, s in enumerate(STATUS_ORDER)],
             ),
             horizontal_grid_lines=fc.ChartGridLines(color="#E3E5EC", width=1),
             max_y=maior_valor + max(1, round(maior_valor * 0.2)),
@@ -1648,17 +1760,14 @@ def main(page: ft.Page):
         )
 
         # --- Gráfico de pizza: distribuição dos status ---
-        total_pizza = recebidos + em_manutencao + concluidos
+        total_pizza = recebidos
         if total_pizza == 0:
             secoes_pizza = [fc.PieChartSection(value=1, color="#DADCE3", title="")]
         else:
             secoes_pizza = [
-                fc.PieChartSection(value=recebidos, color="#2E8BF0", title="Recebidos",
-                                    title_style=ft.TextStyle(size=11, color="white", weight=ft.FontWeight.BOLD)),
-                fc.PieChartSection(value=em_manutencao, color="#F5A623", title="Em manut.",
-                                    title_style=ft.TextStyle(size=11, color="white", weight=ft.FontWeight.BOLD)),
-                fc.PieChartSection(value=concluidos, color="#22A559", title="Concluídos",
-                                    title_style=ft.TextStyle(size=11, color="white", weight=ft.FontWeight.BOLD)),
+                fc.PieChartSection(value=por_status[status], color=STATUS_INFO[status][0], title=str(por_status[status]),
+                                    title_style=ft.TextStyle(size=10, color="white", weight=ft.FontWeight.BOLD))
+                for status in STATUS_ORDER if por_status[status]
             ]
 
         grafico_pizza = fc.PieChart(
@@ -1672,7 +1781,7 @@ def main(page: ft.Page):
             [
                 ft.Container(
                     content=ft.Column(
-                        [titulo_secao("Status dos aparelhos"), grafico_barras],
+                        [titulo_secao("Distribuição por status"), grafico_barras],
                         spacing=14,
                     ),
                     bgcolor="white",
@@ -1866,48 +1975,10 @@ def main(page: ft.Page):
         aparelhos = listar_aparelhos()
 
         status_info = {
-            "pronto": (
-                "#17B96B",
-                "Aparelhos Prontos",
-                "Visualizar aparelhos\nprontos para entrega",
-                ft.Icons.PHONE_ANDROID_ROUNDED,
-            ),
-            "sem_solucao": (
-                "#E51D25",
-                "Sem Solução",
-                "Aparelhos sem solução\nno momento",
-                ft.Icons.BUILD_ROUNDED,
-            ),
-            "aguardando_peca": (
-                "#F39A16",
-                "Aguardando Peça",
-                "Aguardando chegada\nde peça",
-                ft.Icons.INVENTORY_2_ROUNDED,
-            ),
-            "aguardando_autorizacao": (
-                "#6738E8",
-                "Aguardando Autorização",
-                "Aguardando autorização\ndo cliente",
-                ft.Icons.SHIELD_ROUNDED,
-            ),
-            "em_orcamento": (
-                "#2583E8",
-                "Em Orçamento",
-                "Aguardando aprovação\ndo orçamento",
-                ft.Icons.REQUEST_QUOTE_ROUNDED,
-            ),
-            "entregue": (
-                "#7A5AF8",
-                "Aparelhos Entregues",
-                "Aparelhos que já foram\nentregues ao cliente",
-                ft.Icons.LOCAL_SHIPPING_ROUNDED,
-            ),
+            status: (cor, titulo, descricao, getattr(ft.Icons, icone))
+            for status, (cor, titulo, descricao, icone) in STATUS_INFO.items()
         }
-
-        status_alias = {
-            "concluido": "pronto",
-            "em_manutencao": "em_orcamento",
-        }
+        status_alias = {"concluido": "pronto"}
 
         def status_real(a):
             return status_alias.get(a["status"], a["status"] or "em_orcamento")
@@ -1916,7 +1987,7 @@ def main(page: ft.Page):
             conn = get_conn()
             conn.execute(
                 "UPDATE aparelhos SET status = ? WHERE id = ?",
-                (novo_status, aparelho_id),
+                (normalizar_status(novo_status), aparelho_id),
             )
             conn.commit()
             conn.close()
@@ -1968,6 +2039,7 @@ def main(page: ft.Page):
                     "aguardando_autorizacao", "Aguardando Autorização"
                 ),
                 ft.dropdown.Option("em_orcamento", "Em Orçamento"),
+                ft.dropdown.Option("em_manutencao", "Em Manutenção"),
                 ft.dropdown.Option("entregue", "Aparelho Entregue"),
             ]
 
@@ -1992,7 +2064,11 @@ def main(page: ft.Page):
                 )
                 marca_f.value = aparelho["marca"] or ""
                 modelo_f.value = aparelho["modelo"] or ""
-                senha_f.value = aparelho["senha"] or ""
+                try:
+                    senha_f.value = senha_para_edicao(aparelho["senha"])
+                except ValueError as erro:
+                    senha_f.value = ""
+                    page.overlay.append(ft.SnackBar(ft.Text(str(erro)), bgcolor="#E5484D", open=True))
                 acessorios_f.value = aparelho["acessorios"] or ""
                 defeitos_f.value = aparelho["defeitos"] or ""
                 servico_f.value = aparelho["servico"] or ""
@@ -2155,7 +2231,6 @@ def main(page: ft.Page):
                 a["cliente_telefone"],
                 a["marca"],
                 a["modelo"],
-                a["senha"],
                 a["acessorios"],
                 a["defeitos"],
                 a["servico"],
@@ -2488,32 +2563,9 @@ def main(page: ft.Page):
 
             # Exatamente como no modelo: 3 cards na primeira linha e
             # 2 cards na segunda, mantendo a largura dos cards.
-            primeira_linha = ft.Row(
-                [
-                    criar_card_status("pronto"),
-                    criar_card_status("sem_solucao"),
-                    criar_card_status("aguardando_peca"),
-                ],
-                spacing=20,
-                alignment=ft.MainAxisAlignment.START,
-            )
-
-            segunda_linha = ft.Row(
-                [
-                    criar_card_status("aguardando_autorizacao"),
-                    criar_card_status("em_orcamento"),
-                    criar_card_status("entregue"),
-                ],
-                spacing=20,
-                alignment=ft.MainAxisAlignment.START,
-                wrap=True,
-            )
-
-            cards_area.controls.extend(
-                [
-                    primeira_linha,
-                    segunda_linha,
-                ]
+            cards_area.controls.append(
+                ft.Row([criar_card_status(status) for status in STATUS_ORDER], spacing=20,
+                       alignment=ft.MainAxisAlignment.START, wrap=True)
             )
 
         # --------------------------------------------------------------
@@ -2690,6 +2742,11 @@ def main(page: ft.Page):
 
         return ft.Column(
             [
+                ft.Text(
+                    "Fluxo recomendado: Orçamento → Autorização → Peça → Manutenção → Pronto → Entregue. "
+                    "Você pode alterar o status livremente quando necessário.",
+                    size=12, color="#6B7280",
+                ),
                 container_busca_global,
                 area_principal,
             ],
@@ -2896,14 +2953,15 @@ def main(page: ft.Page):
         # ATUALIZA PRÉVIA DA LOGO
         # ----------------------------------------------------------
         def atualizar_preview(caminho):
+            caminho_fisico = caminho_logo(BASE_DIR, caminho)
             preview_logo.content = (
                 ft.Image(
-                    src=caminho,
+                    src=caminho_fisico,
                     width=78,
                     height=78,
                     fit=ft.BoxFit.CONTAIN,
                 )
-                if caminho and os.path.isfile(caminho)
+                if caminho_fisico
                 else ft.Icon(
                     ft.Icons.IMAGE_OUTLINED,
                     size=40,
@@ -2913,7 +2971,7 @@ def main(page: ft.Page):
 
             logo_info.value = (
                 os.path.basename(caminho)
-                if caminho
+                if caminho_fisico
                 else "Nenhuma logo selecionada"
             )
 
@@ -2944,58 +3002,9 @@ def main(page: ft.Page):
                         "Não foi possível acessar a imagem selecionada."
                     )
 
-                pasta_config = os.path.join(
-                    BASE_DIR,
-                    "configuracoes"
-                )
-
-                os.makedirs(
-                    pasta_config,
-                    exist_ok=True
-                )
-
-                extensao = (
-                    os.path.splitext(caminho_origem)[1].lower()
-                    or ".png"
-                )
-
-                # ======================================================
-                # IMPORTANTE:
-                # Cada nova logo recebe um nome diferente.
-                #
-                # Isso evita que o Flet reutilize a imagem anterior
-                # que estava em cache.
-                # ======================================================
-                nome_unico = f"logo_loja_{time.time_ns()}{extensao}"
-
-                caminho_destino = os.path.join(
-                    pasta_config,
-                    nome_unico
-                )
-
-                # Copia a nova logo para um arquivo novo.
-                shutil.copy2(
-                    caminho_origem,
-                    caminho_destino
-                )
-
-                # ======================================================
-                # Remove a logo anterior SOMENTE depois que a nova
-                # já foi copiada com sucesso.
-                # ======================================================
                 caminho_anterior = logo_path_atual[0]
-
-                if (
-                    caminho_anterior
-                    and caminho_anterior != caminho_destino
-                    and os.path.isfile(caminho_anterior)
-                ):
-                    try:
-                        os.remove(caminho_anterior)
-                    except OSError:
-                        pass
-
-                # Atualiza o caminho atualmente selecionado.
+                caminho_destino = salvar_logo(BASE_DIR, caminho_origem)
+                remover_logo_gerenciada(BASE_DIR, caminho_anterior)
                 logo_path_atual[0] = caminho_destino
 
                 # Atualiza imediatamente a prévia da configuração.
@@ -3008,7 +3017,7 @@ def main(page: ft.Page):
                 # ======================================================
                 logo_menu.bgcolor = "#F2F3F7"
                 logo_menu.content = ft.Image(
-                    src=caminho_destino,
+                    src=caminho_logo(BASE_DIR, caminho_destino),
                     width=38,
                     height=38,
                     fit=ft.BoxFit.CONTAIN,
@@ -3152,16 +3161,8 @@ def main(page: ft.Page):
         def remover_logo(e):
             nonlocal logo_path_atual
 
-            caminho_logo = logo_path_atual[0]
-
-            if (
-                caminho_logo
-                and os.path.isfile(caminho_logo)
-            ):
-                try:
-                    os.remove(caminho_logo)
-                except OSError:
-                    pass
+            logo_atual = logo_path_atual[0]
+            remover_logo_gerenciada(BASE_DIR, logo_atual)
 
             logo_path_atual[0] = ""
 
@@ -3460,7 +3461,7 @@ def main(page: ft.Page):
     def atualizar_identidade_loja():
         config = obter_configuracoes()
         nome = config.get("nome_loja") or "MINHA ASSISTÊNCIA"
-        logo = config.get("logo_path") or ""
+        logo = caminho_logo(BASE_DIR, config.get("logo_path") or "")
 
         nome_menu.value = nome
 
@@ -3538,7 +3539,8 @@ def main(page: ft.Page):
     )
 
     navegar("inicio")
+    abrir_dialogo_seguranca()
 
 
 if __name__ == "__main__":
-    ft.run(main)  
+    ft.run(main)
