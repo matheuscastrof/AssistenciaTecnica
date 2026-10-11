@@ -1,0 +1,3518 @@
+import os
+import sqlite3
+import shutil
+import time
+from datetime import datetime
+from reportlab.lib.utils import ImageReader
+import flet as ft
+import flet_charts as fc
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+
+VERSAO_APP = "2.1 - IMPRESSAO"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "assistencia.db")
+
+
+# ------------------------------------------------------------------
+# BANCO DE DADOS (SQLite) — os dados ficam salvos em assistencia.db,
+# na mesma pasta do main.py, e continuam lá mesmo depois de fechar o programa.
+# ------------------------------------------------------------------
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS clientes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            telefone TEXT,
+            endereco TEXT,
+            apelido TEXT
+        );
+        CREATE TABLE IF NOT EXISTS aparelhos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cliente_id INTEGER,
+            marca TEXT,
+            modelo TEXT,
+            senha TEXT,
+            acessorios TEXT,
+            defeitos TEXT,
+            servico TEXT,
+            autorizado INTEGER DEFAULT 0,
+            valor TEXT,
+            orcamento INTEGER DEFAULT 0,
+            relatorio TEXT,
+            observacoes TEXT,
+            status TEXT DEFAULT 'em_manutencao',
+            data_entrada TEXT,
+            FOREIGN KEY(cliente_id) REFERENCES clientes(id)
+        );
+        CREATE TABLE IF NOT EXISTS pecas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            quantidade INTEGER DEFAULT 0,
+            preco REAL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS configuracoes (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            nome_loja TEXT DEFAULT 'MINHA ASSISTÊNCIA',
+            endereco TEXT DEFAULT '',
+            telefone TEXT DEFAULT '',
+            whatsapp TEXT DEFAULT '',
+            instagram TEXT DEFAULT '',
+            logo_path TEXT DEFAULT ''
+        );
+        """
+    )
+
+    # --- Migração automática: adiciona qualquer coluna que esteja faltando ---
+    colunas_esperadas = {
+        "cliente_id": "INTEGER",
+        "marca": "TEXT",
+        "modelo": "TEXT",
+        "senha": "TEXT",
+        "acessorios": "TEXT",
+        "defeitos": "TEXT",
+        "servico": "TEXT",
+        "autorizado": "INTEGER DEFAULT 0",
+        "valor": "TEXT",
+        "orcamento": "INTEGER DEFAULT 0",
+        "relatorio": "TEXT",
+        "observacoes": "TEXT",
+        "status": "TEXT DEFAULT 'em_manutencao'",
+        "data_entrada": "TEXT",
+    }
+    colunas_atuais = {row["name"] for row in conn.execute("PRAGMA table_info(aparelhos)")}
+    for nome_col, tipo_col in colunas_esperadas.items():
+        if nome_col not in colunas_atuais:
+            conn.execute(f"ALTER TABLE aparelhos ADD COLUMN {nome_col} {tipo_col}")
+
+    # Garante que exista uma única configuração da loja.
+    conn.execute(
+        """INSERT OR IGNORE INTO configuracoes
+           (id, nome_loja, endereco, telefone, whatsapp, instagram, logo_path)
+           VALUES (1, 'MINHA ASSISTÊNCIA', '', '', '', '', '')"""
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def obter_configuracoes():
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM configuracoes WHERE id = 1"
+    ).fetchone()
+    conn.close()
+
+    if row:
+        return dict(row)
+
+    return {
+        "id": 1,
+        "nome_loja": "MINHA ASSISTÊNCIA",
+        "endereco": "",
+        "telefone": "",
+        "whatsapp": "",
+        "instagram": "",
+        "logo_path": "",
+    }
+
+
+def salvar_configuracoes(nome_loja, endereco, telefone, whatsapp, instagram, logo_path=""):
+    """Salva/atualiza a única configuração da loja no SQLite."""
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO configuracoes
+               (id, nome_loja, endereco, telefone, whatsapp, instagram, logo_path)
+               VALUES (1, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   nome_loja = excluded.nome_loja,
+                   endereco = excluded.endereco,
+                   telefone = excluded.telefone,
+                   whatsapp = excluded.whatsapp,
+                   instagram = excluded.instagram,
+                   logo_path = excluded.logo_path""",
+            (
+                str(nome_loja or "").strip(),
+                str(endereco or "").strip(),
+                str(telefone or "").strip(),
+                str(whatsapp or "").strip(),
+                str(instagram or "").strip(),
+                str(logo_path or "").strip(),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def proximo_numero_os():
+    """Retorna o próximo número de OS sem reutilizar números já gerados."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS maior_id FROM aparelhos"
+    ).fetchone()
+    maior_id = int(row["maior_id"] or 0)
+
+    # O AUTOINCREMENT do SQLite mantém o maior ID já utilizado,
+    # inclusive quando uma OS antiga é excluída.
+    seq_row = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'aparelhos'"
+    ).fetchone()
+    sequencia = int(seq_row["seq"] or 0) if seq_row else 0
+
+    conn.close()
+    return max(maior_id, sequencia) + 1
+
+
+def formatar_os(numero):
+    """Formata a OS com quatro dígitos: 1 -> 0001."""
+    return f"OS {int(numero):04d}"
+
+
+def imprimir_nota_entrada(dados, numero_os):
+    """Gera a OS em A4 com duas vias, seguindo o modelo do PDF de referência."""
+    pasta_impressoes = os.path.join(BASE_DIR, "impressoes")
+    os.makedirs(pasta_impressoes, exist_ok=True)
+
+    agora = datetime.now()
+    nome_arquivo = f"OS_{int(numero_os):04d}_{agora.strftime('%Y%m%d_%H%M%S')}.pdf"
+    caminho_pdf = os.path.join(pasta_impressoes, nome_arquivo)
+
+    largura, altura = A4
+    c = canvas.Canvas(caminho_pdf, pagesize=A4)
+
+    PRETO = (0.03, 0.03, 0.03)
+    CINZA = (0.48, 0.48, 0.48)
+    VERDE_WHATS = (0.12, 0.72, 0.31)
+    ROSA_INSTA = (0.82, 0.20, 0.48)
+
+    # Dados da loja vêm das Configurações do sistema.
+    config = obter_configuracoes()
+    NOME_ASSISTENCIA = config.get("nome_loja") or "MINHA ASSISTÊNCIA"
+    SUBTITULO = "ASSISTÊNCIA TÉCNICA ESPECIALIZADA"
+    WHATSAPP = config.get("whatsapp") or ""
+    INSTAGRAM = config.get("instagram") or ""
+    ENDERECO_LOJA = config.get("endereco") or ""
+    TELEFONE_LOJA = config.get("telefone") or ""
+    LOGO_LOJA = config.get("logo_path") or ""
+
+    def txt(x, y, valor, tamanho=6, bold=False, align="left", cor=PRETO):
+        c.setFillColorRGB(*cor)
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", tamanho)
+        valor = str(valor or "-")
+        if align == "center":
+            c.drawCentredString(x, y, valor)
+        elif align == "right":
+            c.drawRightString(x, y, valor)
+        else:
+            c.drawString(x, y, valor)
+
+    def hline(x1, y, x2, w=.45, cor=CINZA):
+        c.setStrokeColorRGB(*cor)
+        c.setLineWidth(w)
+        c.line(x1, y, x2, y)
+        c.setStrokeColorRGB(*PRETO)
+
+    def vline(x, y1, y2, w=.45, cor=CINZA):
+        c.setStrokeColorRGB(*cor)
+        c.setLineWidth(w)
+        c.line(x, y1, x, y2)
+        c.setStrokeColorRGB(*PRETO)
+
+    def wrap(texto, max_width, font="Helvetica", size=4.3, max_lines=2):
+        texto = str(texto or "-").strip()
+        palavras = texto.split()
+        linhas = []
+        atual = ""
+        for palavra in palavras:
+            teste = f"{atual} {palavra}".strip()
+            if c.stringWidth(teste, font, size) <= max_width:
+                atual = teste
+            else:
+                if atual:
+                    linhas.append(atual)
+                atual = palavra
+        if atual:
+            linhas.append(atual)
+        return linhas[:max_lines] or ["-"]
+
+    def icon(x, y, kind, size=6.0 * mm):
+        """Ícones pretos usados nos campos, semelhantes aos do modelo."""
+        c.setFillColorRGB(*PRETO)
+        c.roundRect(x, y, size, size, 1.0 * mm, fill=1, stroke=0)
+        cx = x + size / 2
+        cy = y + size / 2
+        c.setStrokeColorRGB(1, 1, 1)
+        c.setFillColorRGB(1, 1, 1)
+        c.setLineWidth(.65)
+
+        if kind == "person":
+            c.circle(cx, cy + 1.0 * mm, .9 * mm, fill=1, stroke=0)
+            c.roundRect(cx - 1.8 * mm, cy - 2.0 * mm, 3.6 * mm, 2.0 * mm, .6 * mm, fill=1, stroke=0)
+        elif kind == "phone":
+            c.roundRect(cx - 1.25 * mm, cy - 2.35 * mm, 2.5 * mm, 4.7 * mm, .45 * mm, fill=0, stroke=1)
+            c.circle(cx, cy - 1.75 * mm, .16 * mm, fill=1, stroke=0)
+        elif kind == "alert":
+            p = c.beginPath()
+            p.moveTo(cx, y + 5.0 * mm)
+            p.lineTo(x + 5.0 * mm, y + 1.0 * mm)
+            p.lineTo(x + 1.0 * mm, y + 1.0 * mm)
+            p.close()
+            c.drawPath(p, fill=1, stroke=0)
+            c.setFillColorRGB(*PRETO)
+            c.setFont("Helvetica-Bold", 3.6 * mm)
+            c.drawCentredString(cx, y + 1.35 * mm, "!")
+        elif kind == "wrench":
+            c.setLineWidth(1.0)
+            c.line(x + 1.5 * mm, y + 1.5 * mm, x + 4.8 * mm, y + 4.8 * mm)
+            c.circle(x + 1.5 * mm, y + 1.5 * mm, .65 * mm, fill=0, stroke=1)
+            c.circle(x + 4.8 * mm, y + 4.8 * mm, .75 * mm, fill=0, stroke=1)
+        elif kind == "money":
+            c.setFillColorRGB(1, 1, 1)
+            c.setFont("Helvetica-Bold", 3.6 * mm)
+            c.drawCentredString(cx, y + .9 * mm, "R$")
+        elif kind == "pencil":
+            c.setLineWidth(1.1)
+            c.line(x + 1.4 * mm, y + 1.4 * mm, x + 4.8 * mm, y + 4.8 * mm)
+        c.setFillColorRGB(*PRETO)
+        c.setStrokeColorRGB(*PRETO)
+
+    def checkbox(x, y, marcado=False):
+        tamanho = 5.0 * mm
+        c.setStrokeColorRGB(*PRETO)
+        c.setLineWidth(.75)
+        c.rect(x, y, tamanho, tamanho, fill=0, stroke=1)
+        if marcado:
+            c.setLineWidth(1.0)
+            c.line(x + 1.0 * mm, y + 2.5 * mm, x + 2.1 * mm, y + 1.2 * mm)
+            c.line(x + 2.1 * mm, y + 1.2 * mm, x + 4.2 * mm, y + 4.0 * mm)
+
+
+    def whatsapp_icon(cx, cy, r=2.1 * mm):
+        caminho_whatsapp = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "icons8-whatsapp-48.png"
+        )
+
+        imagem_whatsapp = ImageReader(caminho_whatsapp)
+
+        tamanho = r * 2
+
+        c.drawImage(
+            imagem_whatsapp,
+            cx - tamanho / 2,
+            cy - tamanho / 2,
+            width=tamanho,
+            height=tamanho,
+            mask="auto"
+        )
+
+    def instagram_icon(cx, cy, size=4.0 * mm):
+        x = cx - size / 2
+        y = cy - size / 2
+        c.setStrokeColorRGB(*ROSA_INSTA)
+        c.setLineWidth(.9)
+        c.roundRect(x, y, size, size, .9 * mm, fill=0, stroke=1)
+        c.circle(cx, cy, .9 * mm, fill=0, stroke=1)
+        c.setFillColorRGB(*ROSA_INSTA)
+        c.circle(x + 3.0 * mm, y + 3.0 * mm, .28 * mm, fill=1, stroke=0)
+        c.setStrokeColorRGB(*PRETO)
+
+    def pattern(cx, cy):
+        """Grade 3x3 de pontos exatamente na área direita superior."""
+        dx = 10.0 * mm
+        dy = 8.0 * mm
+        c.setStrokeColorRGB(*PRETO)
+        c.setLineWidth(.55)
+        for row in range(3):
+            for col in range(3):
+                c.circle(cx + (col - 1) * dx, cy + (1 - row) * dy, 1.25 * mm, fill=0, stroke=1)
+
+    def cabecalho_via(y_top, via_nome):
+        # Medidas da referência: duas vias compactas, separadas por uma linha de corte.
+        x0 = 7.5 * mm
+        x1 = largura - 7.5 * mm
+        via_h = 136.0 * mm
+        y_bottom = y_top - via_h
+
+        c.setStrokeColorRGB(*PRETO)
+        c.setLineWidth(.8)
+        c.roundRect(x0, y_bottom, x1 - x0, via_h, 3.0 * mm, fill=0, stroke=1)
+
+        # ==========================================================
+        # CABEÇALHO
+        # ==========================================================
+        head_top = y_top - 4.0 * mm
+
+        # Logo / identificação.
+        logo_x = 10.5 * mm
+        logo_y = head_top - 13.0 * mm
+        logo_w = 11.5 * mm
+        logo_h = 11.5 * mm
+
+        # Se a loja tiver uma logo cadastrada, ela aparece no PDF.
+        # Se não tiver, mantém o símbolo padrão.
+        logo_existe = bool(LOGO_LOJA and os.path.isfile(LOGO_LOJA))
+        if logo_existe:
+            try:
+                c.drawImage(
+                    ImageReader(LOGO_LOJA),
+                    logo_x,
+                    logo_y,
+                    width=logo_w,
+                    height=logo_h,
+                    preserveAspectRatio=True,
+                    anchor="c",
+                    mask="auto",
+                )
+            except Exception:
+                logo_existe = False
+
+        if not logo_existe:
+            c.setFillColorRGB(*PRETO)
+            c.roundRect(
+                logo_x, logo_y, logo_w, logo_h, 1.0 * mm,
+                fill=1, stroke=0
+            )
+            txt(
+                logo_x + 5.75 * mm, logo_y - 3.0 * mm,
+                "MINHA", 3.4, True, "center"
+            )
+            txt(
+                logo_x + 5.75 * mm, logo_y - 5.5 * mm,
+                "ASSISTÊNCIA", 2.8, True, "center"
+            )
+
+        txt(25.0 * mm, head_top - 4.8 * mm, NOME_ASSISTENCIA, 10.0, True)
+        txt(25.0 * mm, head_top - 9.0 * mm, SUBTITULO, 4.5)
+
+        # Bloco central: redes na primeira linha, endereço na segunda,
+        # telefone na terceira. Tudo centralizado no espaço antes da caixa da OS.
+        centro_x = 105.0 * mm
+        social_y = head_top - 5.2 * mm
+
+        # WhatsApp
+      
+        whatsapp_x = centro_x - 18 * mm
+        whatsapp_icon(whatsapp_x, social_y + .2 * mm, 3.0 * mm)
+        txt(whatsapp_x + 3.0 * mm, social_y - 1.0 * mm, WHATSAPP, 5.1,True)
+
+        # Instagram
+        instagram_x = centro_x + 6 * mm
+        instagram_icon(instagram_x, social_y + .3 * mm, 4.0 * mm)
+        txt(instagram_x + 2.5 * mm, social_y - 1.0 * mm, INSTAGRAM, 5.1,True)
+
+        txt(centro_x, head_top - 10.2 * mm, ENDERECO_LOJA, 5.0,True, "center")
+        txt(centro_x, head_top - 14.2 * mm, f"Telefone: {TELEFONE_LOJA}", 5.1, True, "center")
+
+        # Caixa da via / OS.
+        box_w = 31.5 * mm
+        box_h = 13.5 * mm
+        bx = x1 - box_w - 5.5 * mm
+        by = head_top - 14.0 * mm
+        c.setLineWidth(.7)
+        c.roundRect(bx, by, box_w, box_h, 1.8 * mm, fill=0, stroke=1)
+        txt(bx + box_w / 2, by + 8.7 * mm, f"Via {via_nome}", 4.0, True, "center")
+        txt(bx + box_w / 2, by + 4.0 * mm, f"OS {int(numero_os):04d}", 8.2, True, "center")
+        txt(bx + box_w / 2, by - 4.0 * mm, f"Data da entrada: {agora.strftime('%d/%m/%Y')}", 3.9, False, "center")
+
+        hline(9.5 * mm, head_top - 20.0 * mm, x1 - 2.0 * mm, .7)
+
+        # ==========================================================
+        # CORPO
+        # ==========================================================
+        corpo_top = head_top - 23.0 * mm
+        divisor = 131.5 * mm
+        esquerda = 10.0 * mm
+        direita = divisor + 3.8 * mm
+        limite_esq = divisor - 3.5 * mm
+        limite_dir = x1 - 2.0 * mm
+        centro_dir = (direita + limite_dir) / 2
+
+        vline(divisor, corpo_top + 1.0 * mm, y_bottom + 9.5 * mm, .5)
+
+        # ==========================================================
+        # CLIENTE — telefone fica AO LADO do nome, como no PDF.
+        # ==========================================================
+        icon(esquerda, corpo_top - 7.0 * mm, "person")
+        txt(esquerda + 8.0 * mm, corpo_top - 4.7 * mm, "Cliente", 5.8, True)
+
+        txt(esquerda + 4.0 * mm, corpo_top - 11.0 * mm, "Nome:", 4.3, True)
+        hline(esquerda + 10.0 * mm, corpo_top - 11.8 * mm, esquerda + 60.0 * mm, .4)
+        txt(esquerda + 11.0 * mm, corpo_top - 11.0 * mm, dados.get("nome") or "-", 5.2)
+
+        # Ícone de telefone no centro da mesma seção.
+        icon(79.0 * mm, corpo_top - 12.0 * mm, "phone")
+        txt(87.0 * mm, corpo_top - 10.5 * mm, "Telefone:", 4.0, True)
+        hline(96.0 * mm, corpo_top - 6.2 * mm, limite_esq, .4)
+        txt(97.0 * mm, corpo_top - 10.0 * mm, dados.get("telefone") or "-", 5.0)
+
+        txt(87.0 * mm, corpo_top - 6.0 * mm, "Telefone:", 4.0, True)
+        hline(96.0 * mm, corpo_top - 10.7 * mm, limite_esq, .4)
+        txt(97.0 * mm, corpo_top - 5.0 * mm, dados.get("telefone") or "-", 3.9)
+
+        hline(esquerda, corpo_top - 16.8 * mm, limite_esq, .4)
+
+        # ==========================================================
+        # APARELHO
+        # ==========================================================
+        icon(esquerda, corpo_top - 25.0 * mm, "phone")
+        txt(esquerda + 8.0 * mm, corpo_top - 22.5 * mm, "Aparelho", 5.8, True)
+
+        txt(esquerda + 4.0 * mm, corpo_top - 28.0 * mm, "Marca:", 4.3, True)
+        hline(esquerda + 10.0 * mm, corpo_top - 28.7 * mm, esquerda + 54.0 * mm, .4)
+        txt(esquerda + 14.0 * mm, corpo_top - 28.0 * mm, dados.get("marca") or "-", 5.2)
+
+        txt(esquerda + 65.0 * mm, corpo_top - 28.0 * mm, "Modelo:", 4.3, True)
+        hline(esquerda + 75.0 * mm, corpo_top - 28.0 * mm, limite_esq, .4)
+        txt(esquerda + 78.0 * mm, corpo_top - 27.0 * mm, dados.get("modelo") or "-", 5.2)
+
+        txt(esquerda + 4.0 * mm, corpo_top - 33.0 * mm, "Acessórios:", 4.3, True)
+        hline(esquerda + 14.0 * mm, corpo_top - 33.0 * mm, esquerda + 54.0 * mm, .4)
+        txt(esquerda + 15.0 * mm, corpo_top - 32.0 * mm, dados.get("acessorios") or "-", 5.0)
+
+        txt(esquerda + 65.0 * mm, corpo_top - 33.0 * mm, "Senha:", 4.3, True)
+        hline(esquerda + 75.0 * mm, corpo_top - 33.0 * mm, limite_esq, .4)
+        txt(esquerda + 78.0 * mm, corpo_top - 32.0 * mm, dados.get("senha") or "-", 5.0)
+
+        hline(esquerda, corpo_top - 37.5 * mm, limite_esq, .4)
+
+        # ==========================================================
+        # DEFEITO — título e valor na MESMA LINHA, igual à referência.
+        # ==========================================================
+        icon(esquerda, corpo_top - 46.0 * mm, "alert")
+        txt(esquerda + 8.0 * mm, corpo_top - 43.5 * mm, "Defeito:", 5.7, True)
+        defeito_x = esquerda + 26.0 * mm
+        defeito_max = limite_esq - defeito_x
+        linhas = wrap(dados.get("defeitos"), defeito_max, size=5.0, max_lines=1)
+        txt(defeito_x, corpo_top - 42.5 * mm, linhas[0], 5.0)
+        hline(esquerda + 18.0 * mm, corpo_top - 43.7 * mm, limite_esq, .4)
+        hline(esquerda + 18.0 * mm, corpo_top - 49.0 * mm, limite_esq, .4)
+
+        # ==========================================================
+        # SERVIÇO — também na MESMA LINHA, igual à referência.
+        # ==========================================================
+        icon(esquerda, corpo_top - 59.0 * mm, "wrench")
+        txt(esquerda + 8.0 * mm, corpo_top - 56.5 * mm, "Serviço:", 5.7, True)
+        servico_x = esquerda + 26.0 * mm
+        servico_max = limite_esq - servico_x
+        linhas = wrap(dados.get("servico"), servico_max, size=5.0, max_lines=1)
+        txt(servico_x, corpo_top - 55.5 * mm, linhas[0], 5.0)
+        hline(esquerda + 18.0 * mm, corpo_top - 56.7 * mm, limite_esq, .4)
+        hline(esquerda + 18.0 * mm, corpo_top - 62.0 * mm, limite_esq, .4)
+
+        # ==========================================================
+        # AUTORIZAÇÃO / ORÇAMENTO
+        # ==========================================================
+        y_check = corpo_top - 72.0 * mm
+        checkbox(esquerda + 0.5 * mm, y_check, bool(dados.get("autorizado")))
+        txt(esquerda + 7.0 * mm, y_check + 1.1 * mm, "Serviço autorizado", 4.9, True)
+
+        x_orc = esquerda + 44.0 * mm
+        checkbox(x_orc, y_check, bool(dados.get("orcamento")))
+        txt(x_orc + 7.0 * mm, y_check + 1.1 * mm, "Orçamento", 4.9, True)
+
+        # ==========================================================
+        # VALOR
+        # ==========================================================
+        icon(esquerda, corpo_top - 81.0 * mm, "money")
+        txt(esquerda + 8.0 * mm, corpo_top - 78.6 * mm, "Valor:", 5.4, True)
+        txt(esquerda + 16.0 * mm, corpo_top - 78.6 * mm, "R$", 6.0, True)
+        hline(esquerda + 20.0 * mm, corpo_top - 79.4 * mm, esquerda + 40.0 * mm, .4)
+        txt(esquerda + 21.0 * mm, corpo_top - 78.6 * mm, dados.get("valor") or "0,00", 7.2)
+
+        # ==========================================================
+        # ASSINATURA
+        # ==========================================================
+        icon(esquerda, corpo_top - 92.0 * mm, "pencil")
+        txt(esquerda + 8.0 * mm, corpo_top - 89.6 * mm, "Assinatura:", 5.2, True)
+        hline(esquerda + 29.0 * mm, corpo_top - 90.4 * mm, limite_esq, .4)
+
+        # ==========================================================
+        # DIREITA — PONTOS DE SENHA
+        # ==========================================================
+        txt(centro_dir, corpo_top - 4.7 * mm, "PONTOS DE SENHA", 5.8, True, "center")
+        txt(centro_dir, corpo_top - 8.2 * mm, "(PADRÃO DE DESBLOQUEIO)", 3.9, False, "center")
+
+        # Mais para cima, mas com espaço suficiente até OBSERVAÇÕES.
+        pattern(centro_dir, corpo_top - 22.0 * mm)
+
+        # ==========================================================
+        # DIREITA — OBSERVAÇÕES ABAIXO DOS PONTOS, sem sobreposição.
+        # ==========================================================
+        obs_titulo_y = corpo_top - 54.5 * mm
+        txt(direita, obs_titulo_y, "OBSERVAÇÕES", 5.6, True)
+
+        # A primeira linha começa bem abaixo do título.
+        obs_y = obs_titulo_y - 7.0 * mm
+        for i in range(5):
+            hline(direita, obs_y - i * 5.3 * mm, limite_dir, .4)
+
+        if dados.get("observacoes"):
+            linhas_obs = wrap(dados.get("observacoes"), limite_dir - direita - 2 * mm, size=5.0, max_lines=4)
+            for i, linha in enumerate(linhas_obs):
+                txt(direita + 1.0 * mm, obs_y + 1.0 * mm - i * 5.3 * mm, linha, 5.0)
+
+        # ==========================================================
+        # RODAPÉ
+        # ==========================================================
+        fy = y_bottom + 6.0 * mm
+        hline(9.5 * mm, fy + 3.0 * mm, x1 - 2.0 * mm, .65)
+        txt(largura / 2, fy - .1 * mm, "Agradecemos a preferência!", 5.1, False, "center")
+        txt(largura / 2, fy - 3.2 * mm, "VOLTE SEMPRE!", 4.2, False, "center")
+
+    # Duas vias na mesma folha.
+    primeira_via_top = altura - 3.5 * mm
+    segunda_via_top = 146.0 * mm
+
+    cabecalho_via(primeira_via_top, "CLIENTE")
+
+    metade_corte = 149.0 * mm
+    c.setStrokeColorRGB(*CINZA)
+    c.setDash(4, 3)
+    c.setLineWidth(.4)
+    c.line(8 * mm, metade_corte, largura - 8 * mm, metade_corte)
+    c.setDash()
+
+    cabecalho_via(segunda_via_top, "LOJA")
+
+    c.save()
+
+    try:
+        if os.name == "nt":
+            os.startfile(caminho_pdf)
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", caminho_pdf])
+    except Exception:
+        pass
+
+    return caminho_pdf
+
+def calcular_status_automatico(dados, status_padrao="em_orcamento"):
+    """Define o status pelas marcações da tela. Serviço autorizado tem prioridade."""
+    autorizado = bool(dados.get("autorizado"))
+    orcamento = bool(dados.get("orcamento"))
+
+    if autorizado:
+        return "aguardando_peca"
+    if orcamento:
+        return "em_orcamento"
+    return status_padrao
+
+def maiusculo(texto):
+    return str(texto or "").strip().upper()
+
+def salvar_nota(dados):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO clientes (nome, telefone, endereco, apelido) VALUES (?, ?, ?, ?)",
+        (dados["nome"], dados["telefone"], dados["endereco"], dados["apelido"]),
+    )
+    cliente_id = cur.lastrowid
+    cur.execute(
+                 """INSERT INTO aparelhos
+            (cliente_id, marca, modelo, senha, acessorios, defeitos, servico, autorizado, valor,
+             orcamento, relatorio, observacoes, status, data_entrada)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            cliente_id,
+            dados["marca"], dados["modelo"], dados["senha"], dados["acessorios"],
+                         dados["defeitos"], dados["servico"], 1 if dados["autorizado"] else 0, dados["valor"],
+            1 if dados["orcamento"] else 0, dados["relatorio"], dados["observacoes"],
+            calcular_status_automatico(dados),
+            datetime.now().strftime("%d/%m/%Y %H:%M"),
+        ),
+    )
+    # GARANTIA: depois de inserir, força novamente o status no próprio banco.
+    # Isso evita que qualquer valor padrão/status anterior substitua a regra dos checkboxes.
+    aparelho_id = cur.lastrowid
+    if dados.get("autorizado"):
+        status_final = "aguardando_peca"
+    elif dados.get("orcamento"):
+        status_final = "em_orcamento"
+    else:
+        status_final = dados.get("status", "em_orcamento")
+
+    cur.execute(
+        "UPDATE aparelhos SET status = ? WHERE id = ?",
+        (status_final, aparelho_id),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def adicionar_cliente(nome, telefone="", endereco="", apelido=""):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO clientes (nome, telefone, endereco, apelido) VALUES (?, ?, ?, ?)",
+        (nome, telefone, endereco, apelido),
+    )
+    cliente_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return cliente_id
+
+
+def atualizar_cliente(cliente_id, nome, telefone, endereco, apelido):
+    conn = get_conn()
+    conn.execute(
+        """UPDATE clientes SET nome = ?, telefone = ?, endereco = ?, apelido = ?
+           WHERE id = ?""",
+        (nome, telefone, endereco, apelido, cliente_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def excluir_cliente(cliente_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM aparelhos WHERE cliente_id = ?", (cliente_id,))
+    conn.execute("DELETE FROM clientes WHERE id = ?", (cliente_id,))
+    conn.commit()
+    conn.close()
+
+
+def listar_clientes():
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT c.*, COUNT(a.id) as total_aparelhos
+           FROM clientes c
+           LEFT JOIN aparelhos a ON a.cliente_id = c.id
+           GROUP BY c.id
+           ORDER BY c.id DESC"""
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def listar_aparelhos():
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT a.*, c.nome as cliente_nome, c.telefone as cliente_telefone
+           FROM aparelhos a
+           LEFT JOIN clientes c ON c.id = a.cliente_id
+           ORDER BY a.id DESC"""
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def adicionar_aparelho(dados):
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO aparelhos
+        (cliente_id, marca, modelo, senha, acessorios, defeitos, servico,
+         autorizado, valor, orcamento, relatorio, observacoes, status, data_entrada)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            dados["cliente_id"],
+            dados["marca"],
+            dados["modelo"],
+            dados["senha"],
+            dados["acessorios"],
+            dados["defeitos"],
+            dados["servico"],
+            1 if dados["autorizado"] else 0,
+            dados["valor"],
+            1 if dados["orcamento"] else 0,
+            dados["relatorio"],
+            dados["observacoes"],
+            calcular_status_automatico(dados, dados.get("status", "em_manutencao")),
+            dados.get("data_entrada") or datetime.now().strftime("%d/%m/%Y %H:%M"),
+        ),
+    )
+    conn.commit()
+    conn.close() 
+
+def atualizar_aparelho(aparelho_id, dados):
+    conn = get_conn()
+    conn.execute(
+        """UPDATE aparelhos SET cliente_id = ?, marca = ?, modelo = ?, senha = ?,
+           acessorios = ?, defeitos = ?, servico = ?, autorizado = ?, valor = ?, orcamento = ?,
+           relatorio = ?, observacoes = ? WHERE id = ?""",
+        (
+            dados["cliente_id"], dados["marca"], dados["modelo"], dados["senha"],
+            dados["acessorios"], dados["defeitos"], dados["servico"],1 if dados["autorizado"] else 0, dados["valor"], 1 if dados["orcamento"] else 0, dados["relatorio"],
+            dados["observacoes"], aparelho_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def excluir_aparelho(aparelho_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM aparelhos WHERE id = ?", (aparelho_id,))
+    conn.commit()
+    conn.close()
+
+
+def marcar_aparelho_concluido(aparelho_id):
+    conn = get_conn()
+    conn.execute("UPDATE aparelhos SET status = 'pronto' WHERE id = ?", (aparelho_id,))
+    conn.commit()
+    conn.close()
+
+
+def listar_pecas():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM pecas ORDER BY nome ASC").fetchall()
+    conn.close()
+    return rows
+
+
+def adicionar_peca(nome, quantidade, preco):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO pecas (nome, quantidade, preco) VALUES (?, ?, ?)",
+        (nome, quantidade, preco),
+    )
+    conn.commit()
+    conn.close()
+
+
+def atualizar_peca(peca_id, nome, quantidade, preco):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE pecas SET nome = ?, quantidade = ?, preco = ? WHERE id = ?",
+        (nome, quantidade, preco, peca_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def excluir_peca(peca_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM pecas WHERE id = ?", (peca_id,))
+    conn.commit()
+    conn.close()
+
+
+def obter_estatisticas():
+    conn = get_conn()
+    recebidos = conn.execute("SELECT COUNT(*) FROM aparelhos").fetchone()[0]
+    em_manutencao = conn.execute(
+        "SELECT COUNT(*) FROM aparelhos WHERE status = 'em_manutencao'"
+    ).fetchone()[0]
+    concluidos = conn.execute(
+        "SELECT COUNT(*) FROM aparelhos WHERE status = 'concluido'"
+    ).fetchone()[0]
+    clientes = conn.execute("SELECT COUNT(*) FROM clientes").fetchone()[0]
+    conn.close()
+    return {
+        "recebidos": recebidos,
+        "em_manutencao": em_manutencao,
+        "concluidos": concluidos,
+        "clientes": clientes,
+    }
+
+
+def main(page: ft.Page):
+    init_db()
+
+    page.title = "Assistência Técnica - Ordem de Serviço"
+    page.window.width = 1200
+    page.window.height = 800
+    page.window.min_width = 900
+    page.window.min_height = 600
+    page.padding = 0
+    page.bgcolor = "#F2F3F7"
+    page.fonts = {}
+    page.theme = ft.Theme(font_family="Arial")
+
+    conteudo = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO)
+
+    sombra_cartao = ft.BoxShadow(
+        spread_radius=0,
+        blur_radius=10,
+        color="#14000000",
+        offset=ft.Offset(0, 2),
+    )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def campo(label, expand=1, largura=None, multiline=False, min_lines=1, max_lines=1, password=False):
+        return ft.TextField(
+            label=label,
+            expand=expand if largura is None else False,
+            width=largura,
+            multiline=multiline,
+            min_lines=min_lines,
+            max_lines=max_lines,
+            password=password,
+            can_reveal_password=password,
+            border_radius=8,
+            filled=True,
+            bgcolor="white",
+            border_color="#DADCE3",
+            focused_border_color="#3B5BFD",
+            content_padding=12,
+        )
+
+    def titulo_secao(texto):
+        return ft.Text(texto, size=17, weight=ft.FontWeight.BOLD, color="#2B2F3A")
+
+    def cartao(*controls, padding=20):
+        return ft.Container(
+            content=ft.Column(controls, spacing=14),
+            bgcolor="white",
+            border_radius=12,
+            padding=padding,
+            border=ft.Border.all(1, "#E3E5EC"),
+        )
+
+    # ------------------------------------------------------------------
+    # PÁGINA: NOTA DE ENTRADA
+    # ------------------------------------------------------------------
+    def pagina_nota_entrada():
+        # O número da OS é baseado no ID AUTOINCREMENT da tabela aparelhos.
+        # Assim, uma OS excluída nunca faz o número voltar a ser utilizado.
+        numero_os = proximo_numero_os()
+
+        # --- Dados do cliente ---
+        # Mantemos os valores digitados através do on_change.
+        # Em algumas versões do Flet, ler diretamente .value no clique
+        # pode retornar o valor antigo do controle.
+        valores_nota = {}
+
+        def registrar_valor(e):
+            label = getattr(e.control, "label", None)
+            if label:
+                valores_nota[label] = e.control.value or ""
+
+        def campo_nota(label, **kwargs):
+            controle = campo(label, **kwargs)
+
+            # VISUAL: campos mais baixos e compactos somente na Nota de Entrada.
+            controle.height = 48 if not kwargs.get("multiline") else 82
+            controle.text_size = 15
+            controle.content_padding = ft.Padding.symmetric(
+                horizontal=10,
+                vertical=7
+            )
+
+            def transformar_maiusculo(e):
+                texto = e.control.value or ""
+                texto_maiusculo = texto.upper()
+
+                # Se o texto ainda não estiver em maiúsculo
+                if texto != texto_maiusculo:
+                    e.control.value = texto_maiusculo
+
+                # Registra o valor atualizado
+                registrar_valor(e)
+
+                # FORÇA o campo a mostrar o texto convertido
+                e.control.update()
+
+            controle.on_change = transformar_maiusculo
+
+            valores_nota[label] = ""
+
+            return controle
+
+        nome = campo_nota("Nome do cliente")
+        telefone = campo_nota("Telefone de contato")
+        endereco = campo_nota("Endereço")
+        apelido = campo_nota("Apelido")
+
+        bloco_cliente = cartao(
+            titulo_secao("Dados do Cliente"),
+            ft.Column(
+                [
+                    ft.Row(
+                        [nome, telefone],
+                        spacing=8,
+                    ),
+                    ft.Row(
+                        [endereco, apelido],
+                        spacing=8,
+                    ),
+                ],
+                spacing=8,
+            ),
+            padding=10,
+        )
+
+        # --- Dados do aparelho ---
+        marca = campo_nota("Marca do dispositivo")
+        modelo = campo_nota("Modelo do dispositivo")
+        senha = campo_nota("Senha", password=True)
+        acessorios = campo_nota("Acessórios")
+
+        bloco_aparelho = cartao(
+            titulo_secao("Dados do Aparelho"),
+            ft.Column(
+                [
+                    ft.Row(
+                        [marca, modelo],
+                        spacing=8,
+                    ),
+                    ft.Row(
+                        [senha, acessorios],
+                        spacing=8,
+                    ),
+                ],
+                spacing=8,
+            ),
+            padding=10,
+        )
+
+        # --- Defeitos (checkboxes) ---
+        lista_defeitos = [
+            "Bateria",
+            "Display",
+            "Formatação",
+            "Molhou",
+            "Não liga",
+            "Software",
+            "Tela trincada",
+            "Touch",
+        ]
+
+        # Guarda os defeitos através do próprio evento do Checkbox.
+        # O Flet envia e.data como "true"/"false" no evento on_change.
+        defeitos_selecionados = {d: False for d in lista_defeitos}
+
+        texto_defeitos_selecionados = ft.Text(
+            "Nenhum defeito selecionado",
+            size=14,
+            color="#6B7280",
+        )
+
+        def atualizar_um_defeito(defeito):
+            def handler(e):
+                # e.data é a forma mais confiável de obter o novo estado
+                # do Checkbox no evento do Flet.
+                valor = str(getattr(e, "data", "")).lower()
+                if valor in ("true", "1"):
+                    marcado = True
+                elif valor in ("false", "0"):
+                    marcado = False
+                else:
+                    marcado = bool(getattr(e.control, "value", False))
+
+                defeitos_selecionados[defeito] = marcado
+
+                marcados = [
+                    d for d in lista_defeitos
+                    if defeitos_selecionados[d]
+                ]
+                texto_defeitos_selecionados.value = (
+                    "Selecionados: " + ", ".join(marcados)
+                    if marcados else
+                    "Nenhum defeito selecionado"
+                )
+                page.update()
+
+            return handler
+
+        checks_defeitos = [
+            ft.Checkbox(
+                label=defeito,
+                value=False,
+                label_style=ft.TextStyle(size=14),
+                on_change=atualizar_um_defeito(defeito),
+            )
+            for defeito in lista_defeitos
+        ]
+
+        # VISUAL: defeitos distribuídos em 3 colunas.
+        # A lógica dos Checkbox e seus eventos permanece exatamente igual.
+        coluna_defeitos_1 = ft.Column(
+            [
+                checks_defeitos[0],  # Bateria
+                checks_defeitos[3],  # Molhou
+                checks_defeitos[6],  # Tela trincada
+            ],
+            spacing=2,
+            expand=1,
+        )
+
+        coluna_defeitos_2 = ft.Column(
+            [
+                checks_defeitos[1],  # Display
+                checks_defeitos[4],  # Não liga
+                checks_defeitos[7],  # Touch
+            ],
+            spacing=2,
+            expand=1,
+        )
+
+        coluna_defeitos_3 = ft.Column(
+            [
+                checks_defeitos[2],  # Formatação
+                checks_defeitos[5],  # Software
+            ],
+            spacing=2,
+            expand=1,
+        )
+
+        linhas_defeitos = [
+            ft.Row(
+                [
+                    coluna_defeitos_1,
+                    coluna_defeitos_2,
+                    coluna_defeitos_3,
+                ],
+                spacing=15,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            )
+        ]
+
+        bloco_defeitos = cartao(
+            titulo_secao("Defeito Relatado"),
+            *linhas_defeitos,
+            texto_defeitos_selecionados,
+            padding=10,
+        )
+
+       # --- Serviço autorizado / Valor / Orçamento ---
+
+        campo_servico = campo_nota("Serviço realizado")
+        campo_valor = campo_nota("Valor (R$)", largura=220)
+
+        servico_autorizado_marcado = False
+        orcamento_marcado = False
+
+
+        def mudou_autorizado(e):
+            nonlocal servico_autorizado_marcado
+
+
+            servico_autorizado_marcado = str(e.data).lower() == "true"
+
+
+        def mudou_orcamento(e):
+            nonlocal orcamento_marcado
+
+    
+            orcamento_marcado = str(e.data).lower() == "true"
+
+           
+
+
+        check_autorizado = ft.Checkbox(
+            label="Serviço Autorizado",
+            value=False,
+            on_change=mudou_autorizado,
+        )
+
+        check_orcamento = ft.Checkbox(
+            label="Orçamento",
+            value=False,
+            on_change=mudou_orcamento,
+        )
+
+
+        bloco_servico = cartao(
+            titulo_secao("Serviço"),
+            ft.Column(
+                [
+                    campo_servico,
+                    ft.Row(
+                        [campo_valor, check_autorizado, check_orcamento],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+                spacing=8,
+            ),
+            padding=10,
+        )
+
+        # --- Relatório técnico / Observações ---
+        relatorio_tecnico = campo_nota(
+            "Relatório Técnico", multiline=True, min_lines=5, max_lines=7
+        )
+        observacoes = campo_nota(
+            "Observações", multiline=True, min_lines=5, max_lines=7
+        )
+
+        bloco_relatorio = cartao(
+            ft.Row(
+                [
+                    ft.Column(
+                        [titulo_secao("Relatório Técnico"), relatorio_tecnico],
+                        expand=1,
+                        spacing=4,
+                    ),
+                    ft.Column(
+                        [titulo_secao("Observações"), observacoes],
+                        expand=1,
+                        spacing=4,
+                    ),
+                ],
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
+            padding=10,
+        )
+
+        # --- Assinaturas ---
+        def linha_assinatura(rotulo):
+            return ft.Column(
+                [
+                    ft.Container(
+                        height=38,
+                        border=ft.Border.only(
+                            bottom=ft.BorderSide(1, "#9AA0AC")
+                        ),
+                    ),
+                    ft.Text(
+                        rotulo,
+                        size=10,
+                        color="#6B7280",
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                ],
+                spacing=6,
+                expand=1,
+            )
+
+        bloco_assinaturas = cartao(
+            ft.Row(
+                [
+                    linha_assinatura("Assinatura do Técnico"),
+                    linha_assinatura("Assinatura do Cliente"),
+                ],
+                spacing=20,
+            ),
+            padding=8,
+        )
+
+        # --- Botões de ação ---
+        def salvar_click(e):
+            # O nome também é recuperado do dicionário atualizado pelo on_change.
+            nome_cliente = (
+                valores_nota.get("Nome do cliente")
+                or nome.value
+                or ""
+            ).strip()
+
+            if not nome_cliente:
+                snack_erro = ft.SnackBar(
+                    ft.Text("Informe ao menos o nome do cliente."),
+                    bgcolor="#E5484D",
+                    open=True,
+                )
+                page.overlay.append(snack_erro)
+                page.update()
+                return
+
+            # Usa os valores capturados pelos eventos on_change.
+            # O fallback para .value mantém compatibilidade com versões
+            # do Flet em que o controle já esteja sincronizado.
+            def valor_campo(controle):
+                return valores_nota.get(
+                    controle.label,
+                    controle.value or ""
+                ) or ""
+
+            # Usa o estado que foi registrado pelo evento on_change.
+            # Não dependemos de checkbox.value neste momento.
+            defeitos_marcados = [
+                defeito
+                for defeito in lista_defeitos
+                if defeitos_selecionados.get(defeito, False)
+            ]
+
+            # Regra da Nota de Entrada:
+            # Serviço Autorizado SEMPRE manda para Aguardando Peça.
+            # Orçamento manda para Em Orçamento somente quando autorizado não está marcado.
+            dados_nota = {
+        "nome": maiusculo(nome_cliente),
+        "telefone": maiusculo(valor_campo(telefone)),
+        "endereco": maiusculo(valor_campo(endereco)),
+        "apelido": maiusculo(valor_campo(apelido)),
+        "marca": maiusculo(valor_campo(marca)),
+        "modelo": maiusculo(valor_campo(modelo)),
+        "senha": maiusculo(valor_campo(senha)),
+        "acessorios": maiusculo(valor_campo(acessorios)),
+        "defeitos": maiusculo(", ".join(defeitos_marcados)),
+        "servico": maiusculo(valor_campo(campo_servico)),
+        "autorizado": servico_autorizado_marcado,
+        "valor": valor_campo(campo_valor),  # mantém números
+        "orcamento": orcamento_marcado,
+        "relatorio": maiusculo(valor_campo(relatorio_tecnico)),
+        "observacoes": maiusculo(valor_campo(observacoes)),
+    }
+
+            # Regra DEFINITIVA da Nota de Entrada:
+            # se o checkbox Serviço Autorizado estiver marcado,
+            # o aparelho será gravado como Aguardando Peça.
+            if servico_autorizado_marcado:
+                dados_nota["status"] = "aguardando_peca"
+
+            elif orcamento_marcado:
+                dados_nota["status"] = "em_orcamento"
+
+            else:
+                dados_nota["status"] = "aguardando_autorizacao"
+
+        
+            salvar_nota(dados_nota)
+
+            snack = ft.SnackBar(
+                ft.Text("Nota de entrada salva com sucesso!"),
+                bgcolor="#22A559",
+                open=True,
+            )
+            page.overlay.append(snack)
+
+            # Limpa os campos antes de reconstruir a página.
+            limpar_click(None)
+
+            # Recarrega a lista diretamente do SQLite.
+            navegar("aparelhos")
+
+            page.update()
+
+        def limpar_click(e):
+            nonlocal servico_autorizado_marcado, orcamento_marcado
+            valores_nota.clear()
+
+            controles = [
+                nome, telefone, endereco, apelido,
+                marca, modelo, senha, acessorios,
+                campo_servico, campo_valor,
+                relatorio_tecnico, observacoes,
+            ]
+
+            for c in controles:
+                c.value = ""
+                valores_nota[c.label] = ""
+
+            for c in checks_defeitos:
+                c.value = False
+
+            for defeito in defeitos_selecionados:
+                defeitos_selecionados[defeito] = False
+
+            texto_defeitos_selecionados.value = "Nenhum defeito selecionado"
+
+            check_autorizado.value = False
+            check_orcamento.value = False
+            servico_autorizado_marcado = False
+            orcamento_marcado = False
+            # servico_autorizado_marcado["valor"] = False
+            # orcamento_marcado["valor"] = False
+
+            if e is not None:
+                page.update()
+
+        def salvar_e_imprimir_click(e):
+            # Primeiro salva exatamente os mesmos dados da Nota de Entrada.
+            nome_cliente = (
+                valores_nota.get("Nome do cliente")
+                or nome.value
+                or ""
+            ).strip()
+
+            if not nome_cliente:
+                snack_erro = ft.SnackBar(
+                    ft.Text("Informe ao menos o nome do cliente."),
+                    bgcolor="#E5484D",
+                    open=True,
+                )
+                page.overlay.append(snack_erro)
+                page.update()
+                return
+
+            def valor_campo(controle):
+                return valores_nota.get(
+                    controle.label, controle.value or ""
+                ) or ""
+
+            defeitos_marcados = [
+                defeito for defeito in lista_defeitos
+                if defeitos_selecionados.get(defeito, False)
+            ]
+
+            dados_nota = {
+        "nome": maiusculo(nome_cliente),
+        "telefone": maiusculo(valor_campo(telefone)),
+        "endereco": maiusculo(valor_campo(endereco)),
+        "apelido": maiusculo(valor_campo(apelido)),
+        "marca": maiusculo(valor_campo(marca)),
+        "modelo": maiusculo(valor_campo(modelo)),
+        "senha": maiusculo(valor_campo(senha)),
+        "acessorios": maiusculo(valor_campo(acessorios)),
+        "defeitos": maiusculo(", ".join(defeitos_marcados)),
+        "servico": maiusculo(valor_campo(campo_servico)),
+        "autorizado": servico_autorizado_marcado,
+        "valor": valor_campo(campo_valor),  # mantém números
+        "orcamento": orcamento_marcado,
+        "relatorio": maiusculo(valor_campo(relatorio_tecnico)),
+        "observacoes": maiusculo(valor_campo(observacoes)),
+    }
+            if servico_autorizado_marcado:
+                dados_nota["status"] = "aguardando_peca"
+            elif orcamento_marcado:
+                dados_nota["status"] = "em_orcamento"
+            else:
+                dados_nota["status"] = "aguardando_autorizacao"
+
+            salvar_nota(dados_nota)
+            imprimir_nota_entrada(dados_nota, numero_os)
+
+            snack = ft.SnackBar(
+                ft.Text(f"OS {int(numero_os):04d} salva e arquivo de impressão aberto."),
+                bgcolor="#22A559",
+                open=True,
+            )
+            page.overlay.append(snack)
+            limpar_click(None)
+            navegar("aparelhos")
+            page.update()
+
+        botoes = ft.Row(
+            [
+                ft.OutlinedButton("Limpar", height=38, on_click=limpar_click),
+                ft.ElevatedButton(
+                    "Salvar Nota de Entrada",
+                    height=38,
+                    bgcolor="#3B5BFD",
+                    color="white",
+                    on_click=salvar_click,
+                ),
+                ft.ElevatedButton(
+                    "Salvar e Imprimir",
+                    height=38,
+                    icon=ft.Icons.PRINT_OUTLINED,
+                    bgcolor="#22A559",
+                    color="white",
+                    on_click=salvar_e_imprimir_click,
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.END,
+            spacing=10,
+        )
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Column(
+                            [
+                                ft.Text(
+                                    "Nota de Entrada",
+                                    size=20,
+                                    weight=ft.FontWeight.BOLD,
+                                    color="#1F2430",
+                                ),
+                                ft.Text(
+                                    "Preencha os dados abaixo para registrar a entrada do aparelho.",
+                                    size=11,
+                                    color="#6B7280",
+                                ),
+                            ],
+                            spacing=2,
+                            expand=True,
+                        ),
+                        ft.Container(
+                            content=ft.Column(
+                                [
+                                    ft.Text(
+                                        "NÚMERO DA OS",
+                                        size=10,
+                                        weight=ft.FontWeight.BOLD,
+                                        color="#6B7280",
+                                        text_align=ft.TextAlign.RIGHT,
+                                    ),
+                                    ft.Text(
+                                        formatar_os(numero_os),
+                                        size=24,
+                                        weight=ft.FontWeight.BOLD,
+                                        color="#3B5BFD",
+                                        text_align=ft.TextAlign.RIGHT,
+                                    ),
+                                ],
+                                spacing=0,
+                                horizontal_alignment=ft.CrossAxisAlignment.END,
+                            ),
+                            padding=ft.Padding.symmetric(horizontal=16, vertical=10),
+                            bgcolor="#EEF2FF",
+                            border_radius=10,
+                            border=ft.Border.all(1, "#D8DEFF"),
+                        ),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                ft.Container(height=4),
+                bloco_cliente,
+                bloco_aparelho,
+                bloco_defeitos,
+                bloco_servico,
+                bloco_relatorio,
+                bloco_assinaturas,
+                botoes,
+            ],
+            spacing=7,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
+
+    # ------------------------------------------------------------------
+    # PÁGINA: INÍCIO
+    # ------------------------------------------------------------------
+    def cartao_inicio(icone, cor, titulo, subtitulo, destino):
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Icon(icone, size=30, color=cor),
+                    ft.Container(height=10),
+                    ft.Text(titulo, size=17, weight=ft.FontWeight.BOLD, color="#1F2430"),
+                    ft.Text(subtitulo, size=12, color="#6B7280"),
+                ],
+                spacing=2,
+                horizontal_alignment=ft.CrossAxisAlignment.START,
+            ),
+            width=300,
+            height=190,
+            bgcolor="white",
+            border_radius=10,
+            padding=24,
+            ink=True,
+            on_click=lambda e, c=destino: navegar(c),
+            shadow=sombra_cartao,
+        )
+
+    def pagina_inicio():
+        cartoes = ft.Row(
+            [
+                cartao_inicio(ft.Icons.ASSIGNMENT_ROUNDED, "#2E8BF0", "Nota de Entrada",
+                               "Cadastrar um novo aparelho", "nota_entrada"),
+                cartao_inicio(ft.Icons.PEOPLE_ROUNDED, "#2E8BF0", "Clientes",
+                               "Consultar clientes", "clientes"),
+                cartao_inicio(ft.Icons.PHONE_ANDROID_ROUNDED, "#2E8BF0", "Aparelhos",
+                               "Consultar aparelhos", "aparelhos"),
+                cartao_inicio(ft.Icons.SETTINGS_INPUT_COMPONENT_ROUNDED, "#2E8BF0", "Peças",
+                               "Controlar estoque de peças", "pecas"),
+                cartao_inicio(ft.Icons.BAR_CHART_ROUNDED, "#2E8BF0", "Desempenho",
+                               "Visualizar estatísticas", "desempenho"),
+                cartao_inicio(ft.Icons.SETTINGS_ROUNDED, "#2E8BF0", "Configurações",
+                               "Configurar o sistema", "config"),
+            ],
+            wrap=True,
+            spacing=20,
+            run_spacing=20,
+        )
+
+        return ft.Column(
+            [
+                ft.Text("Bem-vindo!", size=30, weight=ft.FontWeight.BOLD, color="#1F2430"),
+                ft.Text("Sistema de gerenciamento da assistência técnica.",
+                        size=14, color="#6B7280"),
+                ft.Container(height=20),
+                cartoes,
+            ],
+            spacing=4,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
+
+    # ------------------------------------------------------------------
+    # PÁGINA: DESEMPENHO
+    # ------------------------------------------------------------------
+    def cartao_stat(icone, titulo, valor, com_fundo=False):
+        if com_fundo:
+            icone_widget = ft.Container(
+                content=ft.Icon(icone, size=18, color="white"),
+                bgcolor="#2E8BF0",
+                border_radius=30,
+                padding=6,
+            )
+        else:
+            icone_widget = ft.Icon(icone, size=26, color="#2E8BF0")
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    icone_widget,
+                    ft.Container(height=14),
+                    ft.Text(titulo, size=13, color="#3D4250"),
+                    ft.Text(str(valor), size=26, weight=ft.FontWeight.BOLD, color="#1F2430"),
+                ],
+                spacing=4,
+                horizontal_alignment=ft.CrossAxisAlignment.START,
+            ),
+            width=280,
+            bgcolor="white",
+            border_radius=10,
+            padding=20,
+            shadow=sombra_cartao,
+        )
+
+    def pagina_desempenho():
+        stats = obter_estatisticas()
+        recebidos = stats["recebidos"]
+        em_manutencao = stats["em_manutencao"]
+        concluidos = stats["concluidos"]
+        clientes = stats["clientes"]
+
+        cartoes_stat = ft.Row(
+            [
+                cartao_stat(ft.Icons.PHONE_ANDROID_ROUNDED, "Aparelhos recebidos", recebidos),
+                cartao_stat(ft.Icons.BUILD_ROUNDED, "Em manutenção", em_manutencao),
+                cartao_stat(ft.Icons.CHECK_CIRCLE_ROUNDED, "Concluídos", concluidos, com_fundo=True),
+                cartao_stat(ft.Icons.PEOPLE_ROUNDED, "Clientes", clientes),
+            ],
+            wrap=True,
+            spacing=20,
+            run_spacing=20,
+        )
+
+        # --- Gráfico de barras: status dos aparelhos ---
+        maior_valor = max(recebidos, em_manutencao, concluidos, 1)
+
+        grafico_barras = fc.BarChart(
+            groups=[
+                fc.BarChartGroup(
+                    x=0,
+                    rods=[fc.BarChartRod(to_y=recebidos, width=40, color="#2E8BF0",
+                                              border_radius=6, tooltip="Recebidos")],
+                ),
+                fc.BarChartGroup(
+                    x=1,
+                    rods=[fc.BarChartRod(to_y=em_manutencao, width=40, color="#F5A623",
+                                              border_radius=6, tooltip="Em manutenção")],
+                ),
+                fc.BarChartGroup(
+                    x=2,
+                    rods=[fc.BarChartRod(to_y=concluidos, width=40, color="#22A559",
+                                              border_radius=6, tooltip="Concluídos")],
+                ),
+            ],
+            border=ft.Border.all(0, "transparent"),
+            left_axis=fc.ChartAxis(label_size=32, show_labels=True),
+            bottom_axis=fc.ChartAxis(
+                label_size=32,
+                labels=[
+                    fc.ChartAxisLabel(value=0, label=ft.Text("Recebidos", size=11, color="#6B7280")),
+                    fc.ChartAxisLabel(value=1, label=ft.Text("Em manut.", size=11, color="#6B7280")),
+                    fc.ChartAxisLabel(value=2, label=ft.Text("Concluídos", size=11, color="#6B7280")),
+                ],
+            ),
+            horizontal_grid_lines=fc.ChartGridLines(color="#E3E5EC", width=1),
+            max_y=maior_valor + max(1, round(maior_valor * 0.2)),
+            interactive=True,
+            height=260,
+        )
+
+        # --- Gráfico de pizza: distribuição dos status ---
+        total_pizza = recebidos + em_manutencao + concluidos
+        if total_pizza == 0:
+            secoes_pizza = [fc.PieChartSection(value=1, color="#DADCE3", title="")]
+        else:
+            secoes_pizza = [
+                fc.PieChartSection(value=recebidos, color="#2E8BF0", title="Recebidos",
+                                    title_style=ft.TextStyle(size=11, color="white", weight=ft.FontWeight.BOLD)),
+                fc.PieChartSection(value=em_manutencao, color="#F5A623", title="Em manut.",
+                                    title_style=ft.TextStyle(size=11, color="white", weight=ft.FontWeight.BOLD)),
+                fc.PieChartSection(value=concluidos, color="#22A559", title="Concluídos",
+                                    title_style=ft.TextStyle(size=11, color="white", weight=ft.FontWeight.BOLD)),
+            ]
+
+        grafico_pizza = fc.PieChart(
+            sections=secoes_pizza,
+            sections_space=2,
+            center_space_radius=40,
+            height=260,
+        )
+
+        bloco_graficos = ft.Row(
+            [
+                ft.Container(
+                    content=ft.Column(
+                        [titulo_secao("Status dos aparelhos"), grafico_barras],
+                        spacing=14,
+                    ),
+                    bgcolor="white",
+                    border_radius=10,
+                    padding=20,
+                    shadow=sombra_cartao,
+                    expand=1,
+                ),
+                ft.Container(
+                    content=ft.Column(
+                        [titulo_secao("Distribuição por status"), grafico_pizza],
+                        spacing=14,
+                    ),
+                    bgcolor="white",
+                    border_radius=10,
+                    padding=20,
+                    shadow=sombra_cartao,
+                    expand=1,
+                ),
+            ],
+            spacing=20,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
+
+        return ft.Column(
+            [
+                ft.Text("Desempenho", size=30, weight=ft.FontWeight.BOLD, color="#1F2430"),
+                ft.Text("Indicadores da assistência técnica.", size=14, color="#6B7280"),
+                ft.Container(height=20),
+                cartoes_stat,
+                ft.Container(height=24),
+                bloco_graficos,
+            ],
+            spacing=4,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
+
+    # ------------------------------------------------------------------
+    # PÁGINA: CLIENTES
+    # ------------------------------------------------------------------
+    def pagina_clientes():
+        clientes = listar_clientes()
+
+        def fechar_dialog(dialogo):
+            # Mantém o AlertDialog no overlay e apenas fecha a janela.
+            # Isso evita que o diálogo fique preso ou seja recriado em um
+            # estado inconsistente entre as navegações do Flet.
+            dialogo.open = False
+            page.update()
+
+        def abrir_form_cliente(cliente=None):
+            editando = cliente is not None
+            nome_f = campo("Nome do cliente")
+            telefone_f = campo("Telefone de contato")
+            endereco_f = campo("Endereço")
+            apelido_f = campo("Apelido")
+
+            if cliente:
+                nome_f.value = cliente["nome"] or ""
+                telefone_f.value = cliente["telefone"] or ""
+                endereco_f.value = cliente["endereco"] or ""
+                apelido_f.value = cliente["apelido"] or ""
+
+            def salvar_form(e):
+                nome_cliente = (nome_f.value or "").strip()
+                if not nome_cliente:
+                    page.overlay.append(ft.SnackBar(
+                        ft.Text("Informe ao menos o nome do cliente."),
+                        bgcolor="#E5484D", open=True,
+                    ))
+                    page.update()
+                    return
+                if editando:
+                    atualizar_cliente(cliente["id"], nome_cliente, telefone_f.value or "",
+                                      endereco_f.value or "", apelido_f.value or "")
+                else:
+                    adicionar_cliente(nome_cliente, telefone_f.value or "",
+                                      endereco_f.value or "", apelido_f.value or "")
+                fechar_dialog(dialogo)
+                navegar("clientes")
+
+            dialogo = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Editar cliente" if editando else "Adicionar cliente"),
+                content=ft.Column(
+                    [nome_f, telefone_f, endereco_f, apelido_f],
+                    tight=True, width=430, spacing=12,
+                ),
+                actions=[
+                    ft.TextButton("Cancelar", on_click=lambda e: fechar_dialog(dialogo)),
+                    ft.ElevatedButton("Salvar", bgcolor="#3B5BFD", color="white", on_click=salvar_form),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+            page.overlay.append(dialogo)
+            dialogo.open = True
+            page.update()
+
+        def confirmar_exclusao(cliente):
+            def excluir(e):
+                excluir_cliente(cliente["id"])
+                fechar_dialog(dialogo)
+                navegar("clientes")
+
+            dialogo = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Excluir cliente"),
+                content=ft.Text(
+                    f"Deseja excluir {cliente['nome']}? Os aparelhos vinculados a este cliente também serão excluídos."
+                ),
+                actions=[
+                    ft.TextButton("Cancelar", on_click=lambda e: fechar_dialog(dialogo)),
+                    ft.ElevatedButton("Excluir", bgcolor="#E5484D", color="white", on_click=excluir),
+                ],
+            )
+            page.overlay.append(dialogo)
+            dialogo.open = True
+            page.update()
+
+        if not clientes:
+            lista = ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Icon(ft.Icons.PEOPLE_OUTLINE_ROUNDED, size=48, color="#B9BDC9"),
+                        ft.Text("Nenhum cliente cadastrado ainda.", color="#9AA0AC"),
+                        ft.Text("Use o botão acima para adicionar um cliente.", size=12, color="#B9BDC9"),
+                    ],
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    spacing=6,
+                ),
+                alignment=ft.Alignment.CENTER,
+                bgcolor="white", border_radius=12,
+                border=ft.Border.all(1, "#E3E5EC"), padding=60,
+            )
+        else:
+            linhas = []
+            for c in clientes:
+                linhas.append(
+                    ft.Container(
+                        content=ft.Row(
+                            [
+                                ft.Container(
+                                    content=ft.Icon(ft.Icons.PERSON_ROUNDED, color="white", size=20),
+                                    bgcolor="#2E8BF0", border_radius=30, padding=10,
+                                ),
+                                ft.Column(
+                                    [
+                                        ft.Text(c["nome"], size=15, weight=ft.FontWeight.BOLD, color="#1F2430"),
+                                        ft.Text(f"{c['telefone'] or '-'}  •  {c['apelido'] or 'sem apelido'}", size=12, color="#6B7280"),
+                                        ft.Text(c["endereco"] or "-", size=12, color="#9AA0AC"),
+                                    ], spacing=2, expand=True,
+                                ),
+                                ft.Container(
+                                    content=ft.Text(f"{c['total_aparelhos']} aparelho(s)", size=12, color="#2E8BF0", weight=ft.FontWeight.BOLD),
+                                    bgcolor="#E8F1FD", border_radius=20,
+                                    padding=ft.Padding.symmetric(vertical=6, horizontal=12),
+                                ),
+                                ft.IconButton(icon=ft.Icons.EDIT_OUTLINED, tooltip="Editar",
+                                              on_click=lambda e, x=c: abrir_form_cliente(x)),
+                                ft.IconButton(icon=ft.Icons.DELETE_OUTLINE_ROUNDED, icon_color="#E5484D", tooltip="Excluir",
+                                              on_click=lambda e, x=c: confirmar_exclusao(x)),
+                            ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        bgcolor="white", border_radius=10, padding=16, shadow=sombra_cartao,
+                    )
+                )
+            lista = ft.Column(linhas, spacing=12)
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Column([
+                            ft.Text("Clientes", size=30, weight=ft.FontWeight.BOLD, color="#1F2430"),
+                            ft.Text(f"{len(clientes)} cliente(s) cadastrado(s).", size=14, color="#6B7280"),
+                        ], spacing=2, expand=True),
+                        ft.ElevatedButton("Adicionar cliente", icon=ft.Icons.PERSON_ADD_ROUNDED,
+                                          bgcolor="#3B5BFD", color="white", on_click=lambda e: abrir_form_cliente()),
+                    ], vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                ft.Container(height=20), lista,
+            ], spacing=4, scroll=ft.ScrollMode.AUTO, expand=True,
+        )
+
+    # ------------------------------------------------------------------
+    # PÁGINA: APARELHOS
+    # ------------------------------------------------------------------
+    def pagina_aparelhos():
+        aparelhos = listar_aparelhos()
+
+        status_info = {
+            "pronto": (
+                "#17B96B",
+                "Aparelhos Prontos",
+                "Visualizar aparelhos\nprontos para entrega",
+                ft.Icons.PHONE_ANDROID_ROUNDED,
+            ),
+            "sem_solucao": (
+                "#E51D25",
+                "Sem Solução",
+                "Aparelhos sem solução\nno momento",
+                ft.Icons.BUILD_ROUNDED,
+            ),
+            "aguardando_peca": (
+                "#F39A16",
+                "Aguardando Peça",
+                "Aguardando chegada\nde peça",
+                ft.Icons.INVENTORY_2_ROUNDED,
+            ),
+            "aguardando_autorizacao": (
+                "#6738E8",
+                "Aguardando Autorização",
+                "Aguardando autorização\ndo cliente",
+                ft.Icons.SHIELD_ROUNDED,
+            ),
+            "em_orcamento": (
+                "#2583E8",
+                "Em Orçamento",
+                "Aguardando aprovação\ndo orçamento",
+                ft.Icons.REQUEST_QUOTE_ROUNDED,
+            ),
+            "entregue": (
+                "#7A5AF8",
+                "Aparelhos Entregues",
+                "Aparelhos que já foram\nentregues ao cliente",
+                ft.Icons.LOCAL_SHIPPING_ROUNDED,
+            ),
+        }
+
+        status_alias = {
+            "concluido": "pronto",
+            "em_manutencao": "em_orcamento",
+        }
+
+        def status_real(a):
+            return status_alias.get(a["status"], a["status"] or "em_orcamento")
+
+        def atualizar_status(aparelho_id, novo_status):
+            conn = get_conn()
+            conn.execute(
+                "UPDATE aparelhos SET status = ? WHERE id = ?",
+                (novo_status, aparelho_id),
+            )
+            conn.commit()
+            conn.close()
+
+        def fechar_dialog(dialogo):
+            dialogo.open = False
+            page.update()
+
+        def abrir_form_aparelho(aparelho=None):
+            editando = aparelho is not None
+            clientes_atual = listar_clientes()
+
+            if not clientes_atual:
+                page.overlay.append(
+                    ft.SnackBar(
+                        ft.Text("Cadastre um cliente antes de adicionar um aparelho."),
+                        bgcolor="#E5484D",
+                        open=True,
+                    )
+                )
+                page.update()
+                return
+
+            cliente_options = [
+                ft.dropdown.Option(str(c["id"]), c["nome"])
+                for c in clientes_atual
+            ]
+
+            cliente_f = ft.Dropdown(
+                label="Cliente",
+                options=cliente_options,
+                expand=True,
+            )
+            marca_f = campo("Marca do dispositivo")
+            modelo_f = campo("Modelo do dispositivo")
+            senha_f = campo("Senha", password=True)
+            acessorios_f = campo("Acessórios")
+            defeitos_f = campo("Defeito relatado")
+            servico_f = campo("Serviço realizado")
+            autorizado_f = ft.Checkbox(label="Serviço Autorizado", value=False)
+            valor_f = campo("Valor do serviço (R$)")
+            orcamento_f = ft.Checkbox(label="Orçamento", value=False)
+
+            status_options = [
+                ft.dropdown.Option("pronto", "Aparelho Pronto"),
+                ft.dropdown.Option("sem_solucao", "Sem Solução"),
+                ft.dropdown.Option("aguardando_peca", "Aguardando Peça"),
+                ft.dropdown.Option(
+                    "aguardando_autorizacao", "Aguardando Autorização"
+                ),
+                ft.dropdown.Option("em_orcamento", "Em Orçamento"),
+                ft.dropdown.Option("entregue", "Aparelho Entregue"),
+            ]
+
+            status_f = ft.Dropdown(
+                label="Status do aparelho",
+                options=status_options,
+                expand=True,
+            )
+
+            relatorio_f = campo(
+                "Relatório Técnico", multiline=True, min_lines=3, max_lines=5
+            )
+            observacoes_f = campo(
+                "Observações", multiline=True, min_lines=3, max_lines=5
+            )
+
+            if aparelho:
+                cliente_f.value = (
+                    str(aparelho["cliente_id"])
+                    if aparelho["cliente_id"]
+                    else None
+                )
+                marca_f.value = aparelho["marca"] or ""
+                modelo_f.value = aparelho["modelo"] or ""
+                senha_f.value = aparelho["senha"] or ""
+                acessorios_f.value = aparelho["acessorios"] or ""
+                defeitos_f.value = aparelho["defeitos"] or ""
+                servico_f.value = aparelho["servico"] or ""
+                autorizado_f.value = bool(aparelho["autorizado"])
+                valor_f.value = aparelho["valor"] or ""
+                orcamento_f.value = bool(aparelho["orcamento"])
+                status_f.value = status_real(aparelho)
+                relatorio_f.value = aparelho["relatorio"] or ""
+                observacoes_f.value = aparelho["observacoes"] or ""
+            else:
+                status_f.value = "em_orcamento"
+
+            def salvar_form(e):
+                if not cliente_f.value:
+                    page.overlay.append(
+                        ft.SnackBar(
+                            ft.Text("Selecione um cliente."),
+                            bgcolor="#E5484D",
+                            open=True,
+                        )
+                    )
+                    page.update()
+                    return
+
+                dados = {
+                    "cliente_id": int(cliente_f.value),
+                    "marca": marca_f.value or "",
+                    "modelo": modelo_f.value or "",
+                    "senha": senha_f.value or "",
+                    "acessorios": acessorios_f.value or "",
+                    "defeitos": defeitos_f.value or "",
+                    "servico": servico_f.value or "",
+                    "autorizado": autorizado_f.value,
+                    "valor": valor_f.value or "",
+                    "orcamento": orcamento_f.value,
+                    "relatorio": relatorio_f.value or "",
+                    "observacoes": observacoes_f.value or "",
+                }
+
+                # Regras automáticas de status:
+                # Orçamento marcado -> Em Orçamento
+                # Serviço autorizado marcado -> Aguardando Peça
+                # Se nenhum dos dois estiver marcado, mantém o status escolhido.
+                if autorizado_f.value:
+                    status_automatico = "aguardando_peca"
+                elif orcamento_f.value:
+                    status_automatico = "em_orcamento"
+                else:
+                    status_automatico = status_f.value or "em_orcamento"
+
+                if editando:
+                    # Ao editar, NÃO recalcula o status pelos checkboxes.
+                    # Mantém a categoria em que o aparelho já estava.
+                    # O usuário só muda de categoria pelo campo Status do aparelho.
+                    status_edicao = status_f.value or status_real(aparelho)
+                    atualizar_aparelho(aparelho["id"], dados)
+                    atualizar_status(aparelho["id"], status_edicao)
+                else:
+                    # Na criação continuam valendo as regras automáticas.
+                    dados["status"] = status_automatico
+                    adicionar_aparelho(dados)
+
+                fechar_dialog(dialogo)
+                navegar("aparelhos")
+
+            dialogo = ft.AlertDialog(
+                modal=True,
+                title=ft.Row(
+                    [
+                        ft.Text(
+                            "Editar aparelho" if editando else "Adicionar aparelho",
+                            size=20,
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                        ft.Container(expand=True),
+                        ft.Text(
+                            formatar_os(aparelho["id"]) if editando else formatar_os(proximo_numero_os()),
+                            size=18,
+                            weight=ft.FontWeight.BOLD,
+                            color="#3B5BFD",
+                        ),
+                    ],
+                ),
+                content=ft.Column(
+                    [
+                        cliente_f,
+                        ft.Row([marca_f, modelo_f], spacing=10),
+                        ft.Row([senha_f, acessorios_f], spacing=10),
+                        defeitos_f,
+                        ft.Row(
+                            [autorizado_f, orcamento_f],
+                            spacing=15,
+                        ),
+                        status_f,
+                        valor_f,
+                        ft.Row(
+                            [relatorio_f, observacoes_f],
+                            spacing=10,
+                        ),
+                    ],
+                    tight=True,
+                    width=650,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+                actions=[
+                    ft.TextButton(
+                        "Cancelar",
+                        on_click=lambda e: fechar_dialog(dialogo),
+                    ),
+                    ft.ElevatedButton(
+                        "Salvar",
+                        bgcolor="#3B5BFD",
+                        color="white",
+                        on_click=salvar_form,
+                    ),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+
+            page.overlay.append(dialogo)
+            dialogo.open = True
+            page.update()
+
+        def confirmar_exclusao(aparelho):
+            def excluir(e):
+                excluir_aparelho(aparelho["id"])
+                fechar_dialog(dialogo)
+                navegar("aparelhos")
+
+            dialogo = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Excluir aparelho"),
+                content=ft.Text(
+                    "Deseja realmente excluir este aparelho?"
+                ),
+                actions=[
+                    ft.TextButton(
+                        "Cancelar",
+                        on_click=lambda e: fechar_dialog(dialogo),
+                    ),
+                    ft.ElevatedButton(
+                        "Excluir",
+                        bgcolor="#E5484D",
+                        color="white",
+                        on_click=excluir,
+                    ),
+                ],
+            )
+
+            page.overlay.append(dialogo)
+            dialogo.open = True
+            page.update()
+
+        def corresponde(a, termo):
+            if not termo:
+                return True
+
+            partes = [
+                a["cliente_nome"],
+                a["cliente_telefone"],
+                a["marca"],
+                a["modelo"],
+                a["senha"],
+                a["acessorios"],
+                a["defeitos"],
+                a["servico"],
+                a["valor"],
+                a["relatorio"],
+                a["observacoes"],
+                a["data_entrada"],
+                status_info.get(
+                    status_real(a),
+                    ("", status_real(a), "", None),
+                )[1],
+            ]
+
+            texto = " ".join(
+                str(x or "") for x in partes
+            ).lower()
+
+            return termo.lower().strip() in texto
+
+        def montar_linha_aparelho(a, status_atual):
+            cor, titulo, _, _ = status_info[status_atual]
+
+            acoes = [
+                ft.TextButton(
+                    "Editar",
+                    icon=ft.Icons.EDIT_OUTLINED,
+                    on_click=lambda e, x=a: abrir_form_aparelho(x),
+                ),
+                ft.TextButton(
+                    "Excluir",
+                    icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+                    on_click=lambda e, x=a: confirmar_exclusao(x),
+                ),
+            ]
+
+            if status_atual == "pronto":
+                acoes.insert(
+                    0,
+                    ft.ElevatedButton(
+                        "Marcar como Entregue",
+                        icon=ft.Icons.LOCAL_SHIPPING_ROUNDED,
+                        bgcolor="#7A5AF8",
+                        color="white",
+                        on_click=lambda e, x=a: (
+                            atualizar_status(x["id"], "entregue"),
+                            navegar("aparelhos"),
+                        ),
+                    ),
+                )
+
+            outros_status = [
+                (st, info[1])
+                for st, info in status_info.items()
+                if st != status_atual
+            ]
+
+            acoes.append(
+                ft.PopupMenuButton(
+                    icon=ft.Icons.MORE_VERT,
+                    tooltip="Alterar status",
+                    items=[
+                        ft.PopupMenuItem(
+                            content=ft.Text(rotulo),
+                            on_click=lambda e, x=a, st=st: (
+                                atualizar_status(x["id"], st),
+                                navegar("aparelhos"),
+                            ),
+                        )
+                        for st, rotulo in outros_status
+                    ],
+                )
+            )
+
+            return ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.Column(
+                                    [
+                                        ft.Text(
+                                            f"{a['marca'] or '-'} {a['modelo'] or ''}".strip(),
+                                            size=17,
+                                            weight=ft.FontWeight.BOLD,
+                                            color="#1F2430",
+                                        ),
+                                        ft.Text(
+                                            f"Cliente: {a['cliente_nome'] or '-'}",
+                                            size=12,
+                                            color="#6B7280",
+                                        ),
+                                        ft.Text(
+                                            f"Telefone: {a['cliente_telefone'] or '-'}",
+                                            size=12,
+                                            color="#6B7280",
+                                        ),
+                                        ft.Text(
+                                            f"Defeito: {a['defeitos'] or '-'}",
+                                            size=13,
+                                            color="#3D4250",
+                                        ),
+                                        ft.Text(
+                                            f"Serviço: {a['servico'] or '-'}",
+                                            size=13,
+                                            color="#3D4250",
+                                        ),
+                                        ft.Text(
+                                            f"Valor: R$ {a['valor'] or '0,00'}",
+                                            size=13,
+                                            color="#2E8BF0",
+                                            weight=ft.FontWeight.BOLD,
+                                        ),
+                                        ft.Text(
+                                            f"Entrada: {a['data_entrada'] or '-'}",
+                                            size=11,
+                                            color="#9AA0AC",
+                                        ),
+                                    ],
+                                    spacing=3,
+                                    expand=True,
+                                ),
+                                ft.Column(
+                                    [
+                                        ft.Text(
+                                            f"OS: {int(a['id']):04d}",
+                                            size=14,
+                                            weight=ft.FontWeight.BOLD,
+                                            color="#3B5BFD",
+                                        ),
+                                        ft.Container(
+                                            content=ft.Text(
+                                                titulo,
+                                                size=12,
+                                                color="white",
+                                                weight=ft.FontWeight.BOLD,
+                                            ),
+                                            bgcolor=cor,
+                                            border_radius=20,
+                                            padding=ft.Padding.symmetric(
+                                                vertical=6,
+                                                horizontal=12,
+                                            ),
+                                        ),
+                                    ],
+                                    horizontal_alignment=ft.CrossAxisAlignment.END,
+                                    spacing=6,
+                                ),
+                            ],
+                            vertical_alignment=ft.CrossAxisAlignment.START,
+                        ),
+                        ft.Row(
+                            acoes,
+                            alignment=ft.MainAxisAlignment.END,
+                            wrap=True,
+                        ),
+                    ],
+                    spacing=8,
+                ),
+                bgcolor="white",
+                border_radius=10,
+                padding=16,
+                shadow=sombra_cartao,
+            )
+
+        # --------------------------------------------------------------
+        # Busca geral
+        # --------------------------------------------------------------
+        termo_global = ""
+
+        def realizar_busca_global(e):
+            nonlocal termo_global
+            termo_global = e.control.value or ""
+            atualizar_conteudo()
+
+        busca_global = ft.TextField(
+            hint_text="Pesquisar...",
+            label=None,
+            prefix_icon=ft.Icons.SEARCH_ROUNDED,
+            expand=True,
+            text_size=18,
+            height=64,
+            content_padding=ft.Padding.symmetric(
+                horizontal=18,
+                vertical=8,
+            ),
+            border_radius=12,
+            bgcolor="white",
+            border_color="#E5E7EB",
+            on_change=realizar_busca_global,
+        )
+
+        # Container da busca principal.
+        # Ele aparece somente na tela inicial de "Aparelhos".
+        container_busca_global = ft.Container(
+            content=busca_global,
+            height=86,
+            padding=ft.Padding.symmetric(
+                horizontal=10,
+                vertical=10,
+            ),
+            bgcolor="white",
+            border_radius=14,
+            shadow=sombra_cartao,
+        )
+
+        resultado_global = ft.Column(
+            spacing=12,
+            scroll=ft.ScrollMode.AUTO,
+        )
+
+        def mostrar_resultados_globais():
+            resultado_global.controls.clear()
+
+            termo = termo_global.strip()
+            if not termo:
+                return
+
+            encontrados = [
+                a for a in aparelhos
+                if corresponde(a, termo)
+            ]
+
+            resultado_global.controls.append(
+                ft.Text(
+                    f"Resultados para: {termo}",
+                    size=18,
+                    weight=ft.FontWeight.BOLD,
+                    color="#1F2430",
+                )
+            )
+
+            if not encontrados:
+                resultado_global.controls.append(
+                    ft.Container(
+                        content=ft.Text(
+                            "Nenhum aparelho encontrado.",
+                            color="#9AA0AC",
+                            size=14,
+                        ),
+                        padding=20,
+                    )
+                )
+                return
+
+            for a in encontrados:
+                resultado_global.controls.append(
+                    montar_linha_aparelho(
+                        a,
+                        status_real(a),
+                    )
+                )
+
+        # --------------------------------------------------------------
+        # Cards da tela inicial
+        # --------------------------------------------------------------
+        cards_area = ft.Column(spacing=20)
+
+        def abrir_categoria(status):
+            renderizar_categoria(status)
+
+        def criar_card_status(status):
+            cor, titulo, descricao, icone = status_info[status]
+
+            quantidade = sum(
+                1
+                for a in aparelhos
+                if status_real(a) == status
+            )
+
+            # Ícone dentro de um círculo, como no modelo enviado.
+            circulo = ft.Container(
+                content=ft.Icon(
+                    icone,
+                    color=cor,
+                    size=50,
+                ),
+                width=100,
+                height=100,
+                border_radius=50,
+                bgcolor=f"{cor}18",
+                alignment=ft.Alignment.CENTER,
+            )
+
+            return ft.Container(
+                width=290,
+                height=275,
+                bgcolor="white",
+                border_radius=14,
+                padding=ft.Padding.only(
+                    left=24,
+                    right=24,
+                    top=30,
+                    bottom=24,
+                ),
+                shadow=sombra_cartao,
+                ink=True,
+                on_click=lambda e, st=status: abrir_categoria(st),
+                content=ft.Column(
+                    [
+                        circulo,
+                        ft.Container(height=8),
+                        ft.Text(
+                            titulo,
+                            size=19,
+                            weight=ft.FontWeight.BOLD,
+                            color="#172033",
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        ft.Text(
+                            descricao,
+                            size=16,
+                            color="#65708A",
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        ft.Text(
+                            f"{quantidade} aparelho(s)",
+                            size=13,
+                            color=cor,
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                    ],
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    spacing=8,
+                ),
+            )
+
+        def montar_cards():
+            cards_area.controls.clear()
+
+            # Exatamente como no modelo: 3 cards na primeira linha e
+            # 2 cards na segunda, mantendo a largura dos cards.
+            primeira_linha = ft.Row(
+                [
+                    criar_card_status("pronto"),
+                    criar_card_status("sem_solucao"),
+                    criar_card_status("aguardando_peca"),
+                ],
+                spacing=20,
+                alignment=ft.MainAxisAlignment.START,
+            )
+
+            segunda_linha = ft.Row(
+                [
+                    criar_card_status("aguardando_autorizacao"),
+                    criar_card_status("em_orcamento"),
+                    criar_card_status("entregue"),
+                ],
+                spacing=20,
+                alignment=ft.MainAxisAlignment.START,
+                wrap=True,
+            )
+
+            cards_area.controls.extend(
+                [
+                    primeira_linha,
+                    segunda_linha,
+                ]
+            )
+
+        # --------------------------------------------------------------
+        # Tela interna de uma categoria
+        # --------------------------------------------------------------
+        categoria_atual = None
+
+        def renderizar_categoria(status):
+            nonlocal categoria_atual
+            categoria_atual = status
+
+            # Esconde a busca principal ao entrar em uma categoria.
+            # A busca específica da categoria continua visível.
+            container_busca_global.visible = False
+
+            cor, titulo, descricao, icone = status_info[status]
+
+            busca_categoria = ft.TextField(
+                hint_text=f"Pesquisar em {titulo.lower()}...",
+                prefix_icon=ft.Icons.SEARCH_ROUNDED,
+                expand=True,
+                text_size=15,
+            )
+
+            lista_categoria = ft.Column(
+                spacing=12,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+            )
+
+            def atualizar_lista_categoria(e=None):
+                termo = busca_categoria.value or ""
+
+                lista_categoria.controls.clear()
+
+                itens = [
+                    a for a in aparelhos
+                    if status_real(a) == status
+                    and corresponde(a, termo)
+                ]
+
+                if not itens:
+                    lista_categoria.controls.append(
+                        ft.Container(
+                            content=ft.Column(
+                                [
+                                    ft.Icon(
+                                        icone,
+                                        size=50,
+                                        color="#B0B6C4",
+                                    ),
+                                    ft.Text(
+                                        "Nenhum aparelho encontrado.",
+                                        size=16,
+                                        color="#8A91A1",
+                                    ),
+                                ],
+                                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                                spacing=8,
+                            ),
+                            padding=40,
+                            alignment=ft.Alignment.CENTER,
+                        )
+                    )
+                else:
+                    lista_categoria.controls.extend(
+                        [
+                            montar_linha_aparelho(a, status)
+                            for a in itens
+                        ]
+                    )
+
+                page.update()
+
+            busca_categoria.on_change = atualizar_lista_categoria
+
+            atualizar_lista_categoria()
+
+            conteudo_categoria = ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.IconButton(
+                                icon=ft.Icons.ARROW_BACK_ROUNDED,
+                                tooltip="Voltar",
+                                on_click=lambda e: mostrar_inicio(),
+                            ),
+                            ft.Container(
+                                content=ft.Icon(
+                                    icone,
+                                    color=cor,
+                                    size=28,
+                                ),
+                                width=52,
+                                height=52,
+                                border_radius=26,
+                                bgcolor=f"{cor}18",
+                                alignment=ft.Alignment.CENTER,
+                            ),
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        titulo,
+                                        size=25,
+                                        weight=ft.FontWeight.BOLD,
+                                        color="#1F2430",
+                                    ),
+                                    ft.Text(
+                                        descricao.replace("\n", " "),
+                                        size=13,
+                                        color="#6B7280",
+                                    ),
+                                ],
+                                spacing=2,
+                                expand=True,
+                            ),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    busca_categoria,
+                    ft.Container(
+                        content=lista_categoria,
+                        expand=True,
+                    ),
+                ],
+                spacing=14,
+                expand=True,
+            )
+
+            area_principal.controls.clear()
+            area_principal.controls.append(conteudo_categoria)
+            page.update()
+
+        def mostrar_inicio():
+            nonlocal categoria_atual
+            categoria_atual = None
+
+            # Mostra novamente a busca principal ao voltar para "Aparelhos".
+            container_busca_global.visible = True
+
+            montar_cards()
+
+            area_principal.controls.clear()
+            area_principal.controls.append(cards_area)
+
+            atualizar_conteudo()
+
+        def atualizar_conteudo():
+            if categoria_atual is not None:
+                return
+
+            montar_cards()
+            mostrar_resultados_globais()
+
+            area_principal.controls.clear()
+
+            if termo_global.strip():
+                area_principal.controls.append(resultado_global)
+            else:
+                area_principal.controls.append(cards_area)
+
+            page.update()
+
+        area_principal = ft.Column(
+            spacing=16,
+            expand=True,
+        )
+
+        # A primeira abertura da página deve mostrar os cards.
+        # Antes, os cards eram montados em `cards_area`, mas essa área
+        # ainda não era colocada dentro de `area_principal`.
+        montar_cards()
+        area_principal.controls.append(cards_area)
+
+        return ft.Column(
+            [
+                container_busca_global,
+                area_principal,
+            ],
+            spacing=20,
+            expand=True,
+            scroll=ft.ScrollMode.AUTO,
+        )
+
+    # ------------------------------------------------------------------
+    # PÁGINA: PEÇAS
+    # ------------------------------------------------------------------
+    def pagina_pecas():
+        def fechar_dialog(dialogo):
+            # Mantém o AlertDialog no overlay e apenas fecha a janela.
+            # Isso evita que o diálogo fique preso ou seja recriado em um
+            # estado inconsistente entre as navegações do Flet.
+            dialogo.open = False
+            page.update()
+
+        def abrir_form_peca(peca=None):
+            editando = peca is not None
+            nome_f = campo("Nome da peça")
+            qtd_f = campo("Quantidade")
+            preco_f = campo("Preço (R$)")
+            if peca:
+                nome_f.value = peca["nome"] or ""
+                qtd_f.value = str(peca["quantidade"] or 0)
+                preco_f.value = str(peca["preco"] or 0).replace(".", ",")
+
+            def salvar_form(e):
+                nome_peca = (nome_f.value or "").strip()
+                if not nome_peca:
+                    page.overlay.append(ft.SnackBar(ft.Text("Informe o nome da peça."), bgcolor="#E5484D", open=True))
+                    page.update()
+                    return
+                try:
+                    qtd = int(qtd_f.value) if qtd_f.value else 0
+                except ValueError:
+                    qtd = 0
+                try:
+                    preco = float((preco_f.value or "0").replace(",", "."))
+                except ValueError:
+                    preco = 0.0
+                if editando:
+                    atualizar_peca(peca["id"], nome_peca, qtd, preco)
+                else:
+                    adicionar_peca(nome_peca, qtd, preco)
+                fechar_dialog(dialogo)
+                navegar("pecas")
+
+            dialogo = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Editar peça" if editando else "Adicionar peça"),
+                content=ft.Column([nome_f, qtd_f, preco_f], tight=True, width=400, spacing=12),
+                actions=[
+                    ft.TextButton("Cancelar", on_click=lambda e: fechar_dialog(dialogo)),
+                    ft.ElevatedButton("Salvar", bgcolor="#3B5BFD", color="white", on_click=salvar_form),
+                ], actions_alignment=ft.MainAxisAlignment.END,
+            )
+            page.overlay.append(dialogo); dialogo.open = True; page.update()
+
+        def confirmar_exclusao(peca):
+            def excluir(e):
+                excluir_peca(peca["id"])
+                fechar_dialog(dialogo)
+                navegar("pecas")
+            dialogo = ft.AlertDialog(
+                modal=True, title=ft.Text("Excluir peça"),
+                content=ft.Text(f"Deseja excluir a peça '{peca['nome']}'?"),
+                actions=[
+                    ft.TextButton("Cancelar", on_click=lambda e: fechar_dialog(dialogo)),
+                    ft.ElevatedButton("Excluir", bgcolor="#E5484D", color="white", on_click=excluir),
+                ],
+            )
+            page.overlay.append(dialogo); dialogo.open = True; page.update()
+
+        pecas = listar_pecas()
+        if not pecas:
+            lista = ft.Container(
+                content=ft.Column([
+                    ft.Icon(ft.Icons.SETTINGS_INPUT_COMPONENT_ROUNDED, size=48, color="#B9BDC9"),
+                    ft.Text("Nenhuma peça cadastrada ainda.", color="#9AA0AC"),
+                    ft.Text("Use o botão acima para adicionar uma peça.", size=12, color="#B9BDC9"),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, spacing=6),
+                alignment=ft.Alignment.CENTER, bgcolor="white", border_radius=12,
+                border=ft.Border.all(1, "#E3E5EC"), padding=60,
+            )
+        else:
+            linhas = []
+            for p in pecas:
+                linhas.append(ft.Container(
+                    content=ft.Row([
+                        ft.Column([
+                            ft.Text(p["nome"], size=14, weight=ft.FontWeight.BOLD, color="#1F2430"),
+                            ft.Text(f"Qtd: {p['quantidade']}  •  R$ {p['preco']:.2f}", size=12, color="#6B7280"),
+                        ], spacing=2, expand=True),
+                        ft.IconButton(icon=ft.Icons.EDIT_OUTLINED, tooltip="Editar",
+                                      on_click=lambda e, x=p: abrir_form_peca(x)),
+                        ft.IconButton(icon=ft.Icons.DELETE_OUTLINE_ROUNDED, icon_color="#E5484D", tooltip="Excluir",
+                                      on_click=lambda e, x=p: confirmar_exclusao(x)),
+                    ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    bgcolor="white", border_radius=10, padding=14, shadow=sombra_cartao,
+                ))
+            lista = ft.Column(linhas, spacing=10)
+
+        return ft.Column([
+            ft.Row([
+                ft.Column([
+                    ft.Text("Peças", size=30, weight=ft.FontWeight.BOLD, color="#1F2430"),
+                    ft.Text(f"{len(pecas)} peça(s) no estoque.", size=14, color="#6B7280"),
+                ], spacing=2, expand=True),
+                ft.ElevatedButton("Adicionar peça", icon=ft.Icons.ADD_CIRCLE_OUTLINE_ROUNDED,
+                                  bgcolor="#3B5BFD", color="white", on_click=lambda e: abrir_form_peca()),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Container(height=16), lista,
+        ], spacing=4, scroll=ft.ScrollMode.AUTO, expand=True)
+
+    # ------------------------------------------------------------------
+    # PÁGINA: CONFIGURAÇÕES DA LOJA
+    # ------------------------------------------------------------------
+    
+
+    def pagina_configuracoes():
+        config = obter_configuracoes()
+
+        # ----------------------------------------------------------
+        # CAMPOS
+        # ----------------------------------------------------------
+        nome_loja_f = campo("Nome da loja")
+        endereco_f = campo("Endereço")
+        telefone_f = campo("Telefone")
+        whatsapp_f = campo("Número de WhatsApp")
+        instagram_f = campo("@ do Instagram")
+
+        # ----------------------------------------------------------
+        # CARREGA OS DADOS SALVOS
+        # ----------------------------------------------------------
+        nome_loja_f.value = config.get("nome_loja") or ""
+        endereco_f.value = config.get("endereco") or ""
+        telefone_f.value = config.get("telefone") or ""
+        whatsapp_f.value = config.get("whatsapp") or ""
+        instagram_f.value = config.get("instagram") or ""
+
+        # ----------------------------------------------------------
+        # GUARDA OS VALORES DIGITADOS
+        #
+        # Isso evita depender somente de .value no momento em que
+        # o botão Salvar é pressionado.
+        # ----------------------------------------------------------
+        valores_config = {
+            "nome_loja": nome_loja_f.value or "",
+            "endereco": endereco_f.value or "",
+            "telefone": telefone_f.value or "",
+            "whatsapp": whatsapp_f.value or "",
+            "instagram": instagram_f.value or "",
+        }
+
+        def registrar_config(e):
+            if e.control == nome_loja_f:
+                valores_config["nome_loja"] = e.control.value or ""
+
+            elif e.control == endereco_f:
+                valores_config["endereco"] = e.control.value or ""
+
+            elif e.control == telefone_f:
+                valores_config["telefone"] = e.control.value or ""
+
+            elif e.control == whatsapp_f:
+                valores_config["whatsapp"] = e.control.value or ""
+
+            elif e.control == instagram_f:
+                valores_config["instagram"] = e.control.value or ""
+
+        # Registra qualquer alteração feita pelo usuário.
+        nome_loja_f.on_change = registrar_config
+        endereco_f.on_change = registrar_config
+        telefone_f.on_change = registrar_config
+        whatsapp_f.on_change = registrar_config
+        instagram_f.on_change = registrar_config
+
+        # ----------------------------------------------------------
+        # LOGO
+        # ----------------------------------------------------------
+        logo_path_atual = [config.get("logo_path") or ""]
+
+        logo_info = ft.Text(
+            os.path.basename(logo_path_atual[0])
+            if logo_path_atual[0]
+            else "Nenhuma logo selecionada",
+            size=12,
+            color="#6B7280",
+        )
+
+        preview_logo = ft.Container(
+            width=90,
+            height=90,
+            bgcolor="#F2F3F7",
+            border_radius=12,
+            border=ft.Border.all(1, "#E3E5EC"),
+            alignment=ft.Alignment.CENTER,
+        )
+
+        # ----------------------------------------------------------
+        # ATUALIZA PRÉVIA DA LOGO
+        # ----------------------------------------------------------
+        def atualizar_preview(caminho):
+            preview_logo.content = (
+                ft.Image(
+                    src=caminho,
+                    width=78,
+                    height=78,
+                    fit=ft.BoxFit.CONTAIN,
+                )
+                if caminho and os.path.isfile(caminho)
+                else ft.Icon(
+                    ft.Icons.IMAGE_OUTLINED,
+                    size=40,
+                    color="#9AA0AC",
+                )
+            )
+
+            logo_info.value = (
+                os.path.basename(caminho)
+                if caminho
+                else "Nenhuma logo selecionada"
+            )
+
+            page.update()
+
+        atualizar_preview(logo_path_atual[0])
+
+        # ----------------------------------------------------------
+        # SELECIONAR LOGO
+        # ----------------------------------------------------------
+      
+        async def selecionar_logo(e):
+            try:
+                arquivos = await file_picker.pick_files(
+                    dialog_title="Selecione a logo da loja",
+                    allow_multiple=False,
+                    file_type=ft.FilePickerFileType.IMAGE,
+                )
+
+                if not arquivos:
+                    return
+
+                arquivo = arquivos[0]
+                caminho_origem = arquivo.path
+
+                if not caminho_origem or not os.path.isfile(caminho_origem):
+                    raise FileNotFoundError(
+                        "Não foi possível acessar a imagem selecionada."
+                    )
+
+                pasta_config = os.path.join(
+                    BASE_DIR,
+                    "configuracoes"
+                )
+
+                os.makedirs(
+                    pasta_config,
+                    exist_ok=True
+                )
+
+                extensao = (
+                    os.path.splitext(caminho_origem)[1].lower()
+                    or ".png"
+                )
+
+                # ======================================================
+                # IMPORTANTE:
+                # Cada nova logo recebe um nome diferente.
+                #
+                # Isso evita que o Flet reutilize a imagem anterior
+                # que estava em cache.
+                # ======================================================
+                nome_unico = f"logo_loja_{time.time_ns()}{extensao}"
+
+                caminho_destino = os.path.join(
+                    pasta_config,
+                    nome_unico
+                )
+
+                # Copia a nova logo para um arquivo novo.
+                shutil.copy2(
+                    caminho_origem,
+                    caminho_destino
+                )
+
+                # ======================================================
+                # Remove a logo anterior SOMENTE depois que a nova
+                # já foi copiada com sucesso.
+                # ======================================================
+                caminho_anterior = logo_path_atual[0]
+
+                if (
+                    caminho_anterior
+                    and caminho_anterior != caminho_destino
+                    and os.path.isfile(caminho_anterior)
+                ):
+                    try:
+                        os.remove(caminho_anterior)
+                    except OSError:
+                        pass
+
+                # Atualiza o caminho atualmente selecionado.
+                logo_path_atual[0] = caminho_destino
+
+                # Atualiza imediatamente a prévia da configuração.
+                atualizar_preview(caminho_destino)
+
+                # ======================================================
+                # IMPORTANTE:
+                # Atualiza também a logo do menu lateral imediatamente,
+                # sem precisar fechar e abrir o sistema.
+                # ======================================================
+                logo_menu.bgcolor = "#F2F3F7"
+                logo_menu.content = ft.Image(
+                    src=caminho_destino,
+                    width=38,
+                    height=38,
+                    fit=ft.BoxFit.CONTAIN,
+                )
+
+                page.update()
+
+            except Exception as erro:
+                page.overlay.append(
+                    ft.SnackBar(
+                        ft.Text(
+                            f"Erro ao salvar a logo: {erro}"
+                        ),
+                        bgcolor="#E5484D",
+                        open=True,
+                    )
+                )
+
+                page.update()
+
+
+
+        # ----------------------------------------------------------
+        # FILE PICKER
+        # ----------------------------------------------------------
+        file_picker = ft.FilePicker()
+        page.services.append(file_picker)
+
+        # ----------------------------------------------------------
+        # SALVAR CONFIGURAÇÕES
+        # ----------------------------------------------------------
+        def salvar_config_click(e):
+
+            # Usa os valores registrados pelos on_change.
+            nome_loja = (
+                valores_config["nome_loja"] or ""
+            ).strip()
+
+            endereco = (
+                valores_config["endereco"] or ""
+            ).strip()
+
+            telefone = (
+                valores_config["telefone"] or ""
+            ).strip()
+
+            whatsapp = (
+                valores_config["whatsapp"] or ""
+            ).strip()
+
+            instagram = (
+                valores_config["instagram"] or ""
+            ).strip()
+
+            # Nome da loja é obrigatório.
+            if not nome_loja:
+                page.overlay.append(
+                    ft.SnackBar(
+                        ft.Text(
+                            "Informe o nome da loja."
+                        ),
+                        bgcolor="#E5484D",
+                        open=True,
+                    )
+                )
+
+                page.update()
+                return
+
+            # ------------------------------------------------------
+            # SALVA OS DADOS
+            # ------------------------------------------------------
+            salvar_configuracoes(
+                nome_loja,
+                endereco,
+                telefone,
+                whatsapp,
+                instagram,
+                logo_path_atual[0],
+            )
+
+            # ------------------------------------------------------
+            # LÊ NOVAMENTE DO BANCO
+            #
+            # Assim confirmamos que os valores gravados são os que
+            # serão utilizados pelo restante do sistema.
+            # ------------------------------------------------------
+            config_salva = obter_configuracoes()
+
+            valores_config["nome_loja"] = (
+                config_salva.get("nome_loja") or ""
+            )
+
+            valores_config["endereco"] = (
+                config_salva.get("endereco") or ""
+            )
+
+            valores_config["telefone"] = (
+                config_salva.get("telefone") or ""
+            )
+
+            valores_config["whatsapp"] = (
+                config_salva.get("whatsapp") or ""
+            )
+
+            valores_config["instagram"] = (
+                config_salva.get("instagram") or ""
+            )
+
+            logo_path_atual[0] = (
+                config_salva.get("logo_path") or ""
+            )
+
+            # ------------------------------------------------------
+            # ATUALIZA OS CAMPOS NA TELA
+            # ------------------------------------------------------
+            nome_loja_f.value = valores_config["nome_loja"]
+            endereco_f.value = valores_config["endereco"]
+            telefone_f.value = valores_config["telefone"]
+            whatsapp_f.value = valores_config["whatsapp"]
+            instagram_f.value = valores_config["instagram"]
+
+            # Atualiza menu lateral.
+            atualizar_identidade_loja()
+
+            page.overlay.append(
+                ft.SnackBar(
+                    ft.Text(
+                        "Configurações da loja salvas com sucesso!"
+                    ),
+                    bgcolor="#22A559",
+                    open=True,
+                )
+            )
+
+            page.update()
+
+        # ----------------------------------------------------------
+        # REMOVER LOGO
+        # ----------------------------------------------------------
+        def remover_logo(e):
+            nonlocal logo_path_atual
+
+            caminho_logo = logo_path_atual[0]
+
+            if (
+                caminho_logo
+                and os.path.isfile(caminho_logo)
+            ):
+                try:
+                    os.remove(caminho_logo)
+                except OSError:
+                    pass
+
+            logo_path_atual[0] = ""
+
+            # Salva os dados atuais sem a logo.
+            salvar_configuracoes(
+                valores_config["nome_loja"] or "",
+                valores_config["endereco"] or "",
+                valores_config["telefone"] or "",
+                valores_config["whatsapp"] or "",
+                valores_config["instagram"] or "",
+                "",
+            )
+
+            atualizar_preview("")
+
+            atualizar_identidade_loja()
+
+            page.overlay.append(
+                ft.SnackBar(
+                    ft.Text("Logo removida."),
+                    bgcolor="#22A559",
+                    open=True,
+                )
+            )
+
+            page.update()
+
+        # ----------------------------------------------------------
+        # INTERFACE
+        # ----------------------------------------------------------
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Column(
+                            [
+                                ft.Text(
+                                    "Configurações",
+                                    size=30,
+                                    weight=ft.FontWeight.BOLD,
+                                    color="#1F2430",
+                                ),
+                                ft.Text(
+                                    "Cadastre os dados da sua loja. "
+                                    "Eles serão usados no sistema e na "
+                                    "nota de entrada em PDF.",
+                                    size=14,
+                                    color="#6B7280",
+                                ),
+                            ],
+                            spacing=2,
+                            expand=True,
+                        ),
+                    ]
+                ),
+
+                ft.Container(height=10),
+
+                # --------------------------------------------------
+                # IDENTIDADE DA LOJA
+                # --------------------------------------------------
+                cartao(
+                    titulo_secao("Identidade da Loja"),
+
+                    ft.Row(
+                        [
+                            preview_logo,
+
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        "Logo da loja",
+                                        size=14,
+                                        weight=ft.FontWeight.BOLD,
+                                        color="#2B2F3A",
+                                    ),
+
+                                    logo_info,
+
+                                    ft.Row(
+                                        [
+                                            ft.ElevatedButton(
+                                                "Selecionar logo",
+                                                icon=ft.Icons.IMAGE_OUTLINED,
+                                                bgcolor="#3B5BFD",
+                                                color="white",
+                                                on_click=selecionar_logo,
+                                            ),
+
+                                            ft.OutlinedButton(
+                                                "Remover logo",
+                                                icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+                                                on_click=remover_logo,
+                                            ),
+                                        ],
+                                        spacing=10,
+                                    ),
+                                ],
+                                spacing=8,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=20,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+
+                    nome_loja_f,
+
+                    ft.Text(
+                        "O nome informado aqui também aparecerá "
+                        "no cabeçalho da nota de entrada.",
+                        size=11,
+                        color="#9AA0AC",
+                    ),
+                ),
+
+                # --------------------------------------------------
+                # CONTATO
+                # --------------------------------------------------
+                cartao(
+                    titulo_secao("Contato da Loja"),
+
+                    ft.Row(
+                        [
+                            endereco_f,
+                            telefone_f,
+                        ],
+                        spacing=14,
+                    ),
+
+                    ft.Row(
+                        [
+                            whatsapp_f,
+                            instagram_f,
+                        ],
+                        spacing=14,
+                    ),
+
+                    ft.Text(
+                        "Esses dados serão exibidos no cabeçalho do PDF.",
+                        size=11,
+                        color="#9AA0AC",
+                    ),
+                ),
+
+                # --------------------------------------------------
+                # BOTÃO SALVAR
+                # --------------------------------------------------
+                ft.Row(
+                    [
+                        ft.Container(
+                            expand=True
+                        ),
+
+                        ft.ElevatedButton(
+                            "Salvar configurações",
+                            icon=ft.Icons.SAVE_OUTLINED,
+                            bgcolor="#22A559",
+                            color="white",
+                            on_click=salvar_config_click,
+                        ),
+                    ]
+                ),
+            ],
+
+            spacing=16,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
+
+
+    # ------------------------------------------------------------------
+    # PÁGINAS SIMPLES (placeholders)
+    # ------------------------------------------------------------------
+    def pagina_generica(titulo, subtitulo):
+        return ft.Column(
+            [
+                ft.Text(titulo, size=24, weight=ft.FontWeight.BOLD, color="#1F2430"),
+                ft.Text(subtitulo, size=13, color="#6B7280"),
+                ft.Container(height=20),
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Icon(ft.Icons.CONSTRUCTION, size=48, color="#B9BDC9"),
+                            ft.Text("Em construção", color="#9AA0AC"),
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                    ),
+                    alignment=ft.Alignment.CENTER,
+                    bgcolor="white",
+                    border_radius=12,
+                    border=ft.Border.all(1, "#E3E5EC"),
+                    padding=60,
+                ),
+            ],
+            spacing=8,
+            expand=True,
+        )
+
+    paginas = {
+        "inicio": pagina_inicio,
+        "nota_entrada": pagina_nota_entrada,
+        "clientes": pagina_clientes,
+        "aparelhos": pagina_aparelhos,
+        "pecas": pagina_pecas,
+        "desempenho": pagina_desempenho,
+        "config": pagina_configuracoes,
+    }
+
+    # ------------------------------------------------------------------
+    # MENU LATERAL
+    # ------------------------------------------------------------------
+    itens_menu = [
+        ("inicio", ft.Icons.HOME_ROUNDED, "Início"),
+        ("nota_entrada", ft.Icons.ASSIGNMENT_ROUNDED, "Nota de Entrada"),
+        ("clientes", ft.Icons.PEOPLE_ROUNDED, "Clientes"),
+        ("aparelhos", ft.Icons.PHONE_ANDROID_ROUNDED, "Aparelhos"),
+        ("pecas", ft.Icons.SETTINGS_INPUT_COMPONENT_ROUNDED, "Peças"),
+        ("desempenho", ft.Icons.BAR_CHART_ROUNDED, "Desempenho"),
+        ("config", ft.Icons.SETTINGS_ROUNDED, "Configurações"),
+    ]
+
+    botoes_menu = {}
+
+    def navegar(chave):
+        if chave not in paginas:
+            return
+
+        # Fecha qualquer diálogo que ainda esteja aberto antes de reconstruir
+        # o conteúdo principal.
+        for controle in list(page.overlay):
+            if isinstance(controle, ft.AlertDialog):
+                controle.open = False
+
+        conteudo.controls.clear()
+        conteudo.controls.append(
+            ft.Container(content=paginas[chave](), padding=30, expand=True)
+        )
+
+        for k, btn in botoes_menu.items():
+            ativo = k == chave
+            btn.bgcolor = "#3B5BFD" if ativo else None
+            btn.content.controls[0].color = "white" if ativo else "#5B6070"
+            btn.content.controls[1].color = "white" if ativo else "#2B2F3A"
+            btn.content.controls[1].weight = (
+                ft.FontWeight.BOLD if ativo else ft.FontWeight.NORMAL
+            )
+
+        page.update()
+
+    def criar_item_menu(chave, icone, texto):
+        item = ft.Container(
+            content=ft.Row(
+                [
+                    ft.Icon(icone, size=20, color="#5B6070"),
+                    ft.Text(texto, size=14, color="#2B2F3A"),
+                ],
+                spacing=12,
+            ),
+            padding=ft.Padding.symmetric(vertical=12, horizontal=16),
+            border_radius=8,
+            on_click=lambda e, c=chave: navegar(c),
+            ink=True,
+        )
+        botoes_menu[chave] = item
+        return item
+
+    config_inicial = obter_configuracoes()
+
+    logo_menu = ft.Container(
+        width=44,
+        height=44,
+        bgcolor="#3B5BFD",
+        border_radius=10,
+        alignment=ft.Alignment.CENTER,
+    )
+
+    nome_menu = ft.Text(
+        config_inicial.get("nome_loja") or "MINHA ASSISTÊNCIA",
+        size=17,
+        weight=ft.FontWeight.BOLD,
+        color="#1F2430",
+        max_lines=1,
+        overflow=ft.TextOverflow.ELLIPSIS,
+    )
+
+    subtitulo_menu = ft.Text(
+        "Assistência Técnica",
+        size=10,
+        color="#9AA0AC",
+        max_lines=1,
+        overflow=ft.TextOverflow.ELLIPSIS,
+    )
+
+    def atualizar_identidade_loja():
+        config = obter_configuracoes()
+        nome = config.get("nome_loja") or "MINHA ASSISTÊNCIA"
+        logo = config.get("logo_path") or ""
+
+        nome_menu.value = nome
+
+        if logo and os.path.isfile(logo):
+            logo_menu.bgcolor = "#F2F3F7"
+            logo_menu.content = ft.Image(
+                src=logo,
+                width=38,
+                height=38,
+                fit=ft.BoxFit.CONTAIN,
+            )
+        else:
+            logo_menu.bgcolor = "#3B5BFD"
+            logo_menu.content = ft.Icon(
+                ft.Icons.PHONE_IPHONE_ROUNDED,
+                color="white",
+                size=22,
+            )
+
+        page.update()
+
+    atualizar_identidade_loja()
+
+    menu_lateral = ft.Container(
+        width=250,
+        bgcolor="white",
+        border=ft.Border.only(right=ft.BorderSide(1, "#E3E5EC")),
+        content=ft.Column(
+            [
+                # Logo e nome da loja configurados pelo usuário.
+                ft.Container(
+                    content=ft.Row(
+                        [
+                            logo_menu,
+                            ft.Column(
+                                [
+                                    nome_menu,
+                                    subtitulo_menu,
+                                ],
+                                spacing=0,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=10,
+                    ),
+                    padding=20,
+                ),
+                ft.Divider(height=1, color="#E3E5EC"),
+                ft.Container(
+                    content=ft.Column(
+                        [criar_item_menu(c, i, t) for c, i, t in itens_menu],
+                        spacing=4,
+                    ),
+                    padding=ft.Padding.symmetric(vertical=12, horizontal=12),
+                    expand=True,
+                ),
+                ft.Container(
+                    content=ft.Text(f"versão {VERSAO_APP}", size=10, color="#B9BDC9"),
+                    padding=ft.Padding.symmetric(vertical=10, horizontal=16),
+                ),
+            ],
+            spacing=0,
+        ),
+    )
+
+    page.add(
+        ft.Row(
+            [
+                menu_lateral,
+                ft.Container(content=conteudo, expand=True, bgcolor="#F2F3F7"),
+            ],
+            spacing=0,
+            expand=True,
+        )
+    )
+
+    navegar("inicio")
+
+
+if __name__ == "__main__":
+    ft.run(main)  
